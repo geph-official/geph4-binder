@@ -276,8 +276,6 @@ impl BinderCore {
             .write()
             .insert(UserKey::UserID(user_info.userid), probable_ip);
         // we don't check "bans" yet at this point.
-
-        self.check_login_ratelimit(user_info.userid)?;
         self.verify_password(username, password)?;
 
         let actual_level = user_info
@@ -297,6 +295,9 @@ impl BinderCore {
                 epoch
             )
         }
+
+        // we only ratelimit here, to prevent incorrect login attempts from being counted
+        self.check_login_ratelimit(user_info.userid)?;
         if (real_epoch as i32 - epoch as i32).abs() <= 1 {
             let sig = key.blind_sign(epoch, blinded_digest);
             Ok((user_info, sig))
