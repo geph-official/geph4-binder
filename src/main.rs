@@ -1,7 +1,8 @@
+mod antigfw;
 mod bindercore;
 mod responder;
 use env_logger::Env;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -24,7 +25,7 @@ struct Opt {
 }
 
 fn main() {
-    env_logger::Builder::from_env(Env::default().default_filter_or("geph4_binder=debug")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("geph4_binder=info")).init();
     let opt = Opt::from_args();
     let binder_core = bindercore::BinderCore::create(
         &opt.database,
@@ -55,5 +56,5 @@ fn main() {
             copp.timer("latency", time.as_secs_f64())
         });
     println!("HTTP listening on {}", opt.listen_http);
-    responder::handle_requests(http_serv, &binder_core, statsd_client)
+    responder::handle_requests(http_serv, Arc::new(binder_core), Arc::new(statsd_client))
 }

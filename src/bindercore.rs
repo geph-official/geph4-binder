@@ -2,9 +2,10 @@ use geph4_binder_transport::{
     BinderError, BridgeDescriptor, ExitDescriptor, SubscriptionInfo, UserInfo,
 };
 
+use cached::Cached;
 use native_tls::{Certificate, TlsConnector};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use postgres_native_tls::MakeTlsConnector;
 use r2d2_postgres::PostgresConnectionManager;
 
@@ -13,16 +14,24 @@ use std::{
     convert::TryFrom,
     convert::TryInto,
     ffi::{CStr, CString},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     ops::DerefMut,
     time::Duration,
     time::SystemTime,
 };
 
+use crate::antigfw::{Tracker, UserKey};
+
 pub struct BinderCore {
     captcha_service: String,
     mizaru_sk: Mutex<HashMap<String, mizaru::SecretKey>>,
     conn_pool: r2d2::Pool<PostgresConnectionManager<postgres_native_tls::MakeTlsConnector>>,
+
+    // bridge cache
+    bridge_cache: Mutex<cached::SizedCache<(Vec<u8>, String), Vec<BridgeDescriptor>>>,
+
+    // anti-GFW tracker
+    tracker: RwLock<Tracker>,
 }
 
 impl BinderCore {
@@ -37,11 +46,13 @@ impl BinderCore {
         BinderCore {
             captcha_service: captcha_service_url.to_string(),
             mizaru_sk: Mutex::new(HashMap::new()),
+            bridge_cache: Mutex::new(cached::SizedCache::with_size(10000)),
             conn_pool: r2d2::Builder::new()
                 .min_idle(Some(2))
-                .max_size(8)
+                .max_size(16)
                 .build(manager)
                 .unwrap(),
+            tracker: Default::default(),
         }
     }
 
@@ -177,7 +188,7 @@ impl BinderCore {
         captcha_soln: &str,
     ) -> Result<(), BinderError> {
         if !verify_captcha(&self.captcha_service, captcha_id, captcha_soln)? {
-            log::warn!("{} is not soln to {}", captcha_soln, captcha_id);
+            log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
             return Err(BinderError::WrongCaptcha);
         }
         if self.user_exists(username)? {
@@ -249,6 +260,7 @@ impl BinderCore {
     /// Validates the username and password, and if it is valid, blind-sign the given digest and return the signature.
     pub fn authenticate(
         &self,
+        probable_ip: IpAddr,
         username: &str,
         password: &str,
         level: &str,
@@ -258,9 +270,15 @@ impl BinderCore {
         if level != "free" && level != "plus" {
             return Err(BinderError::Other("mizaru failed".into()));
         }
-        let user_info = self.get_user_info(&username)?;
+
+        let user_info = self.get_user_info(username)?;
+        self.tracker
+            .write()
+            .insert(UserKey::UserID(user_info.userid), probable_ip);
+        // we don't check "bans" yet at this point.
+
         self.check_login_ratelimit(user_info.userid)?;
-        self.verify_password(&username, &password)?;
+        self.verify_password(username, password)?;
 
         let actual_level = user_info
             .clone()
@@ -272,6 +290,13 @@ impl BinderCore {
         }
         let key = self.get_mizaru_sk(level)?;
         let real_epoch = mizaru::time_to_epoch(SystemTime::now());
+        if real_epoch != epoch {
+            log::warn!(
+                "out-of-sync epoch: real_epoch={}, their_epoch={}",
+                real_epoch,
+                epoch
+            )
+        }
         if (real_epoch as i32 - epoch as i32).abs() <= 1 {
             let sig = key.blind_sign(epoch, blinded_digest);
             Ok((user_info, sig))
@@ -298,12 +323,13 @@ impl BinderCore {
         let days_past = existing_time.elapsed().unwrap_or_default().as_secs_f32() / 86400.0;
         let new_intensity = existing_intensity * (0.5f32.powf(days_past)) + 1.0;
         if new_intensity > MAX_INTENSITY {
+            // log::warn!("ratelimiting user {}", uid);
             return Err(BinderError::Other(format!(
                 "too many logins recently (intensity {})",
                 existing_intensity
             )));
         }
-        txn.execute("insert into login_intensity (id, intensity, last_login) values ($1, $2, $3) on conflict (id) do update set intensity = excluded.intensity", 
+        txn.execute("insert into login_intensity (id, intensity, last_login) values ($1, $2, $3) on conflict (id) do update set intensity = excluded.intensity, last_login = excluded.last_login", 
         &[&uid, &new_intensity, &SystemTime::now()]).map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
         txn.commit()
             .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
@@ -362,7 +388,8 @@ impl BinderCore {
         }
         let update_time: std::time::SystemTime =
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(update_time);
-        let query = "insert into routes (hostname, sosistab_pubkey, bridge_address, bridge_group, update_time) values ($1, $2, $3, $4, $5)";
+        let query = r"insert into routes (hostname, sosistab_pubkey, bridge_address, bridge_group, update_time) values ($1, $2, $3, $4, $5) on conflict (bridge_address) do
+                             update set hostname = excluded.hostname, sosistab_pubkey = excluded.sosistab_pubkey, bridge_group = excluded.bridge_group, update_time = excluded.update_time";
         txn.execute(
             query,
             &[
@@ -375,7 +402,7 @@ impl BinderCore {
         )
         .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
         txn.execute(
-            "delete from routes where update_time < NOW() - interval '2 minute'",
+            "delete from routes where update_time < NOW() - interval '5 minute'",
             &[],
         )
         .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
@@ -420,11 +447,91 @@ impl BinderCore {
     /// Get all bridges.
     pub fn get_bridges(
         &self,
+        probable_ip: IpAddr,
+        _country_code: impl Fn() -> String,
         level: &str,
         unblinded_digest: &[u8],
         unblinded_signature: &mizaru::UnblindedSignature,
         exit_hostname: &str,
     ) -> Result<Vec<BridgeDescriptor>, BinderError> {
+        // First we authenticate
+        let key = self.get_mizaru_sk(level)?.to_public_key();
+        if !key.blind_verify(unblinded_digest, unblinded_signature) {
+            log::warn!("invalid digest in get_bridges! {}", probable_ip);
+            return Err(BinderError::Other("mizaru failed".into()));
+        }
+
+        // Then, we check the bridge cache
+        if let Some(res) = self
+            .bridge_cache
+            .lock()
+            .cache_get(&(unblinded_digest.to_vec(), exit_hostname.to_string()))
+            .cloned()
+        {
+            let mut client = self.get_pg_conn()?;
+            let mut txn: postgres::Transaction<'_> = client
+                .transaction()
+                .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            // Great, we have a cached value. We must validate it by ensuring that every single element is still present in the system
+            let failed = res.iter().find(|item| {
+                let count: Option<i64> = txn
+                    .query_one(
+                        "select count(*) from routes where sosistab_pubkey = $1",
+                        &[&item.sosistab_key.to_bytes().to_vec()],
+                    )
+                    .ok()
+                    .map(|r| r.get(0));
+                count.unwrap_or_default() == 0
+            });
+            if let Some(failed) = failed {
+                log::warn!(
+                    "bridge {} is out of date, regenerating list!",
+                    failed.endpoint
+                );
+            } else {
+                // log::info!("serving out {} CACHED bridges", res.len());
+                return Ok(res);
+            }
+        }
+
+        let token_id = hex::encode(blake3::hash(unblinded_digest).as_bytes())[0..16].to_string();
+
+        // decide whether or not to quarantine
+        self.tracker
+            .write()
+            .insert(UserKey::TokenHash(token_id.clone()), probable_ip);
+        let should_quarantine = {
+            let tracker = self.tracker.read();
+            if tracker.is_banned_key(UserKey::TokenHash(token_id.clone())) {
+                log::warn!("saw BANNED KEY {} at tracker: {}:", token_id, probable_ip);
+                true
+            } else if tracker.is_banned_ip(probable_ip) {
+                log::warn!("saw SUSPICIOUS IP at tracker: {}", probable_ip);
+                false
+            } else if self.is_black_token(&token_id)? {
+                log::warn!(
+                    "saw MANUALLY BANNED TOKEN ({}) at tracker with IP {}",
+                    token_id,
+                    probable_ip
+                );
+                true
+            } else {
+                false
+            }
+        };
+        // if should_quarantine && country_code() == "TM" {
+        //     log::warn!("RESCINDING ban due to Turkmenistan!");
+        //     should_quarantine = false;
+        // }
+
+        // "silently" quarantine
+        if should_quarantine {
+            log::warn!(
+                "quarantine activated for token {}, IP address {}",
+                token_id,
+                probable_ip
+            );
+        }
         if !self.validate(level, unblinded_digest, unblinded_signature)? {
             return Err(BinderError::NoUserFound);
         }
@@ -433,15 +540,39 @@ impl BinderCore {
         let mut txn: postgres::Transaction<'_> = client
             .transaction()
             .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
-        let query = "select bridge_address,sosistab_pubkey,bridge_group from routes where update_time > NOW() - interval '2 minute' and hostname=$1 and bridge_group not in (select bridge_group from route_blacklist where hostname=$1)";
+
+        // if quarantined, we permaban this IP.
+        if should_quarantine {
+            txn.query(
+                "insert into token_blacklist values ($1) on conflict do nothing",
+                &[&token_id],
+            )
+            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        }
+
+        let mut query: String =  "select bridge_address,sosistab_pubkey,bridge_group from routes where update_time > NOW() - interval '3 minute' and hostname=$1 and bridge_group not in (select bridge_group from route_blacklist where hostname=$1)".into();
+        if should_quarantine {
+            query += " and bridge_group in (select bridge_group from route_quarantine)"
+        }
+        if level == "free" {
+            query += " and bridge_group not in (select bridge_group from route_premium)"
+        }
+
+        let query: &str = &query;
+
+        // log::info!("{}", query);
+
         let mut rows = txn
             .query(query, &[&exit_hostname])
             .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
         // we sort by the keyed hash of the bridge address with the given unblinded digest. This ensures reasonable stability.
         rows.sort_by_key(|row| {
             let addr: String = row.get(0);
-            *blake3::keyed_hash(blake3::hash(unblinded_digest).as_bytes(), addr.as_bytes())
-                .as_bytes()
+            *blake3::keyed_hash(
+                blake3::hash(unblinded_digest).as_bytes(),
+                addr.split(':').next().unwrap().as_bytes(),
+            )
+            .as_bytes()
         });
         let mut res: Vec<_> = rows
             .into_iter()
@@ -464,7 +595,43 @@ impl BinderCore {
         res.sort_by(|a, b| a.1.cmp(&b.1));
         res.dedup_by(|a, b| a.1 == b.1);
         log::debug!("serving out {} bridges", res.len());
-        Ok(res.into_iter().map(|v| v.0).collect())
+
+        // we insert these into the assignment records
+        for (bridge, _) in res.iter() {
+            let bridge_ip = bridge.endpoint.ip();
+            txn.query(
+                "insert into bridge_assignments values ($1, $2) on conflict do nothing",
+                &[&token_id, &bridge_ip.to_string()],
+            )
+            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        // fix
+        let res = res.into_iter().map(|v| v.0).collect::<Vec<_>>();
+        if !res.is_empty() {
+            self.bridge_cache.lock().cache_set(
+                (unblinded_digest.to_vec(), exit_hostname.to_string()),
+                res.clone(),
+            );
+        }
+        Ok(res)
+    }
+
+    /// Should I quarantine?
+    fn is_black_token(&self, token_id: &str) -> Result<bool, BinderError> {
+        let mut client = self.get_pg_conn()?;
+        let row = client
+            .query_one(
+                "select count(key) from token_blacklist where key=$1",
+                &[&token_id],
+            )
+            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let count: i64 = row.get(0);
+        if count > 0 {
+            log::warn!("{} in token blacklist", token_id);
+        }
+        Ok(count > 0)
     }
 }
 
@@ -479,18 +646,17 @@ fn generate_captcha(captcha_service: &str) -> Result<String, BinderError> {
             .into_string()
             .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?)
     } else {
-        Err(BinderError::DatabaseFailed("captcha failed".into()))
+        Err(BinderError::Other("captcha failed".into()))
     }
 }
 
 /// Verify a captcha.
-#[allow(clippy::unnecessary_wraps)]
 fn verify_captcha(
     captcha_service: &str,
     captcha_id: &str,
     solution: &str,
 ) -> Result<bool, BinderError> {
-    log::warn!(
+    log::debug!(
         "verify_captcha({}, {}, {})",
         captcha_service,
         captcha_id,
@@ -503,6 +669,15 @@ fn verify_captcha(
     ))
     .timeout(Duration::from_secs(1))
     .call();
+    if resp.synthetic() {
+        return Err(BinderError::Other(
+            resp.synthetic_error()
+                .as_ref()
+                .unwrap()
+                .status_text()
+                .into(),
+        ));
+    }
     // TODO handle network errors
     Ok(resp.ok())
 }
