@@ -19,6 +19,9 @@ struct Opt {
     /// HTTP listening port
     #[structopt(default_value = "127.0.0.1:18080", long)]
     listen_http: SocketAddr,
+    /// GFW reporting address
+    #[structopt(long)]
+    gfwreport_addr: SocketAddr,
     #[structopt(long, default_value = "172.105.28.221:8125")]
     /// UDP address of the statsd daemon
     statsd_addr: SocketAddr,
@@ -31,20 +34,21 @@ fn main() {
         &opt.database,
         &opt.captcha_endpoint,
         &std::fs::read(opt.database_ca_cert).unwrap(),
+        opt.gfwreport_addr,
     );
     let master_secret = binder_core.get_master_sk().unwrap();
     let free_mizaru_sk = binder_core.get_mizaru_sk("free").unwrap();
     let plus_mizaru_sk = binder_core.get_mizaru_sk("plus").unwrap();
-    println!("geph4-binder starting with:");
-    println!(
+    eprintln!("geph4-binder starting with:");
+    eprintln!(
         "  Master x25519 public key = {}",
         hex::encode(x25519_dalek::PublicKey::from(&master_secret).to_bytes())
     );
-    println!(
+    eprintln!(
         "  Mizaru public key (FREE) = {}",
         hex::encode(free_mizaru_sk.to_public_key().0)
     );
-    println!(
+    eprintln!(
         "  Mizaru public key (PLUS) = {}",
         hex::encode(plus_mizaru_sk.to_public_key().0)
     );
@@ -56,5 +60,6 @@ fn main() {
             copp.timer("latency", time.as_secs_f64())
         });
     println!("HTTP listening on {}", opt.listen_http);
-    responder::handle_requests(http_serv, Arc::new(binder_core), Arc::new(statsd_client))
+    let bcore = Arc::new(binder_core);
+    responder::handle_requests(http_serv, bcore, Arc::new(statsd_client))
 }

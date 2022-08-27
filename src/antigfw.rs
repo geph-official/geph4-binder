@@ -1,8 +1,42 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr, UdpSocket},
     time::SystemTime,
 };
+
+use serde::Serialize;
+
+#[derive(Serialize, Clone, Debug)]
+pub enum Report {
+    /// Reports a bridge that's now blocked
+    Blocked(String),
+    /// Reports an IP/UID association
+    IpUid { ip: String, uid: u64 },
+    /// Reports an IP/key association
+    IpKey { ip: String, key: String },
+}
+
+/// A client for GFW reporting
+pub struct GfwReportClient {
+    sock: UdpSocket,
+    remote: SocketAddr,
+}
+
+impl GfwReportClient {
+    /// Create a new GFW reporting client
+    pub fn new(remote: SocketAddr) -> Self {
+        let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
+        Self { sock, remote }
+    }
+
+    /// Sends a report to the remote
+    pub fn send(&self, r: Report) {
+        let bts = serde_json::to_vec(&r).unwrap();
+        if let Err(err) = self.sock.send_to(&bts, self.remote) {
+            log::error!("failed to send report: {:?}", err);
+        }
+    }
+}
 
 /// A key representing an observed "users".
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,7 +58,7 @@ pub struct Tracker {
     reverse: BTreeMap<IpAddr, BTreeSet<UserKey>>,
 }
 
-const BAN_THRESHOLD: usize = 20;
+const BAN_THRESHOLD: usize = 30;
 
 impl Tracker {
     /// Insert a key/IP pair
@@ -76,7 +110,11 @@ impl Tracker {
     fn alive(&self, ip: IpAddr) -> bool {
         self.creation
             .get(&ip)
-            .map(|v| v.elapsed().map(|v| v.as_secs() < 86400).unwrap_or_default())
+            .map(|v| {
+                v.elapsed()
+                    .map(|v| v.as_secs() < 86400 * 7)
+                    .unwrap_or_default()
+            })
             .unwrap_or_default()
     }
 }

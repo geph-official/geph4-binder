@@ -1,41 +1,37 @@
 use crate::bindercore::BinderCore;
 use geph4_binder_transport::{BinderError, BinderRequestData, BinderResponse, BinderServer};
-use governor::{
-    clock::QuantaClock,
-    state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter,
-};
+
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use rand::prelude::*;
-use serde::Deserialize;
+use rusty_pool::ThreadPool;
+use tap::Tap;
+
 use std::{
-    net::{IpAddr, Ipv4Addr},
-    num::NonZeroU32,
+    net::Ipv4Addr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use threadpool::ThreadPool;
+
 /// Retry an action indefinitely when the database errors out
 fn db_retry<T>(action: impl Fn() -> Result<T, BinderError>) -> Result<T, BinderError> {
     for retries in 1.. {
         match action() {
             Err(BinderError::DatabaseFailed(s)) => {
-                if retries > 10 {
+                if retries > 3 {
                     log::warn!("DB retried many times now: {}", s);
                     return Err(BinderError::DatabaseFailed(s));
                 }
-                let sleep_low = 2u64.pow(retries) * 20;
-                let sleep_high = 2u64.pow(retries + 1) * 20;
+                let sleep_low = 2u64.pow(retries) * 10;
+                let sleep_high = 2u64.pow(retries + 1) * 100;
                 let actual = rand::thread_rng().gen_range(sleep_low, sleep_high);
-                if retries > 3 {
-                    log::warn!(
-                        "[retries={}] DB contention ({}); sleeping for {} ms",
-                        retries,
-                        s,
-                        actual
-                    );
-                }
+                // if retries > 1 {
+                log::warn!(
+                    "[retries={}] DB contention ({}); sleeping for {} ms",
+                    retries,
+                    s,
+                    actual
+                );
+                // }
                 std::thread::sleep(Duration::from_millis(actual));
             }
             x => return x,
@@ -57,8 +53,6 @@ pub fn handle_requests(
     }
 }
 
-static TPOOL: Lazy<Mutex<ThreadPool>> = Lazy::new(|| Mutex::new(ThreadPool::new(16)));
-
 fn handle_request_once(
     serv: &impl BinderServer,
     core: Arc<BinderCore>,
@@ -68,8 +62,22 @@ fn handle_request_once(
     let probable_ip = req
         .probable_ip()
         .unwrap_or_else(|| Ipv4Addr::from(0).into());
-    TPOOL.lock().execute(move || {
-        let country_code = || geolocate(probable_ip).unwrap_or_else(|_| "XXXX".to_string());
+
+    static POOL: Lazy<ThreadPool> = Lazy::new(|| ThreadPool::new(1, 64, Duration::from_secs(10)));
+    let submit_time = Instant::now();
+    POOL.execute(move || {
+        let delay = submit_time.elapsed();
+        if delay.as_secs_f64() > 0.5 {
+            eprintln!("**** FAILING due to massive delay of {:?} ****", delay);
+            req.respond(Err(BinderError::Other("binder overload".into())));
+            return;
+        }
+        let dcopy = req.request_data.clone();
+        eprintln!(
+            "{:?} sent us {}",
+            req.probable_ip(),
+            &format!("{:?}", dcopy).tap_mut(|s| s.truncate(20))
+        );
         let res = match &req.request_data {
             // password change request
             BinderRequestData::ChangePassword {
@@ -100,6 +108,10 @@ fn handle_request_once(
                     *epoch as usize,
                     blinded_digest,
                 )?;
+                let sub_count = core.count_subscriptions()?;
+                statsd_client.gauge("subcount", sub_count as f64);
+                let recent_users = core.count_recent_users()?;
+                statsd_client.gauge("usercount", recent_users as f64);
                 statsd_client.incr("Authenticate");
                 Ok(BinderResponse::AuthenticateResp {
                     user_info,
@@ -117,14 +129,17 @@ fn handle_request_once(
             })
             .map(BinderResponse::ValidateResp),
             // get a CAPTCHA
-            BinderRequestData::GetCaptcha => db_retry(|| {
-                let (captcha_id, png_data) = core.get_captcha()?;
-                statsd_client.incr("GetCaptcha");
-                Ok(BinderResponse::GetCaptchaResp {
-                    captcha_id,
-                    png_data,
+            BinderRequestData::GetCaptcha => {
+                // Err(BinderError::Other("emergency".to_string()))
+                db_retry(|| {
+                    let (captcha_id, png_data) = core.get_captcha()?;
+                    statsd_client.incr("GetCaptcha");
+                    Ok(BinderResponse::GetCaptchaResp {
+                        captcha_id,
+                        png_data,
+                    })
                 })
-            }),
+            }
             // register a user
             BinderRequestData::RegisterUser {
                 username,
@@ -182,7 +197,6 @@ fn handle_request_once(
             } => db_retry(|| {
                 let resp = core.get_bridges(
                     probable_ip,
-                    country_code,
                     level,
                     unblinded_digest,
                     unblinded_signature,
@@ -197,25 +211,4 @@ fn handle_request_once(
         req.respond(res);
     });
     Ok(())
-}
-
-static GEOLOCATE_RATE_LIMIT: Lazy<RateLimiter<NotKeyed, InMemoryState, QuantaClock>> =
-    Lazy::new(|| RateLimiter::direct(Quota::per_minute(NonZeroU32::new(40u32).unwrap())));
-
-#[cached::proc_macro::cached(result = true)]
-fn geolocate(ipaddr: IpAddr) -> anyhow::Result<String> {
-    futures_lite::future::block_on(GEOLOCATE_RATE_LIMIT.until_ready());
-    // if GEOLOCATE_RATE_LIMIT.check().is_err() {
-    //     anyhow::bail!("ip API rate limit hit")
-    // }
-    #[derive(Deserialize)]
-    #[allow(non_snake_case)]
-    struct Resp {
-        countryCode: String,
-    }
-    let resp = ureq::get(&format!("http://ip-api.com/json/{}", ipaddr))
-        .timeout(Duration::from_secs(2))
-        .call();
-    let resp: Resp = serde_json::from_str(&resp.into_string()?)?;
-    Ok(resp.countryCode)
 }
