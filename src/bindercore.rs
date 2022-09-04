@@ -1,3 +1,5 @@
+mod bridge_db;
+
 use geph4_binder_transport::{
     BinderError, BridgeDescriptor, ExitDescriptor, SubscriptionInfo, UserInfo,
 };
@@ -5,7 +7,7 @@ use geph4_binder_transport::{
 use moka::sync::Cache;
 use native_tls::{Certificate, TlsConnector};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use postgres_native_tls::MakeTlsConnector;
 use r2d2_postgres::PostgresConnectionManager;
 
@@ -20,12 +22,16 @@ use std::{
     time::SystemTime,
 };
 
-use crate::antigfw::{GfwReportClient, Report, Tracker, UserKey};
+use crate::{
+    antigfw::{GfwReportClient, Report},
+    POOL_SIZE,
+};
+
+type PostgresPool = r2d2::Pool<PostgresConnectionManager<postgres_native_tls::MakeTlsConnector>>;
 
 pub struct BinderCore {
     captcha_service: String,
     mizaru_sk: Mutex<HashMap<String, mizaru::SecretKey>>,
-    conn_pool: r2d2::Pool<PostgresConnectionManager<postgres_native_tls::MakeTlsConnector>>,
 
     // caches
     bridge_cache: Cache<(Vec<u8>, String), Vec<BridgeDescriptor>>,
@@ -33,11 +39,11 @@ pub struct BinderCore {
     pwd_cache: Cache<(String, String), bool>,
     validate_cache: Cache<blake3::Hash, bool>,
 
-    // anti-GFW tracker
-    tracker: RwLock<Tracker>,
-
     // reporter
     reporter: GfwReportClient,
+
+    // postgres pool
+    conn_pool: PostgresPool,
 }
 
 impl BinderCore {
@@ -62,8 +68,8 @@ impl BinderCore {
                 .time_to_live(Duration::from_secs(1000))
                 .build(),
             bridge_cache: Cache::builder()
-                .max_capacity(10000)
-                .time_to_live(Duration::from_secs(1000))
+                .max_capacity(100000)
+                .time_to_live(Duration::from_secs(4000))
                 .build(),
             validate_cache: Cache::builder()
                 .max_capacity(10000)
@@ -72,13 +78,14 @@ impl BinderCore {
             exit_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(60))
                 .build(),
+
+            reporter: GfwReportClient::new(gfwreport_addr),
+
             conn_pool: r2d2::Builder::new()
-                .min_idle(Some(64))
-                .max_size(64)
+                .max_size(POOL_SIZE as _)
+                .connection_timeout(Duration::from_secs(1))
                 .build(manager)
                 .unwrap(),
-            tracker: Default::default(),
-            reporter: GfwReportClient::new(gfwreport_addr),
         }
     }
 
@@ -99,9 +106,8 @@ impl BinderCore {
                 "insert into secrets values ($1, $2)",
                 &[&"MASTER", &bincode::serialize(&sk).unwrap()],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
-            txn.commit()
-                .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
+            txn.commit().map_err(to_dberr)?;
             Ok(sk)
         }
     }
@@ -118,12 +124,10 @@ impl BinderCore {
         }
         let key_name = format!("mizaru-master-sk-{}", acct_level);
         let mut client = self.get_pg_conn()?;
-        let mut txn = client
-            .transaction()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let mut txn = client.transaction().map_err(to_dberr)?;
         let row = txn
             .query_opt("select value from secrets where key=$1", &[&key_name])
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
         match row {
             Some(row) => {
                 let res: mizaru::SecretKey =
@@ -137,7 +141,7 @@ impl BinderCore {
                     "insert into secrets values ($1, $2)",
                     &[&key_name, &bincode::serialize(&secret_key).unwrap()],
                 )
-                .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+                .map_err(to_dberr)?;
                 txn.commit().unwrap();
                 Ok(secret_key)
             }
@@ -153,15 +157,13 @@ impl BinderCore {
     /// Obtain the user info given the username.
     fn get_user_info(&self, username: &str) -> Result<UserInfo, BinderError> {
         let mut client = self.get_pg_conn()?;
-        let mut txn = client
-            .transaction()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let mut txn = client.transaction().map_err(to_dberr)?;
         let rows = txn
             .query(
                 "select id,username,pwdhash from users where username = $1",
                 &[&username],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
         if rows.is_empty() {
             return Err(BinderError::NoUserFound);
         }
@@ -174,7 +176,7 @@ impl BinderCore {
                 "select plan, extract(epoch from expires) from subscriptions where id=$1",
                 &[&userid],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?
+            .map_err(to_dberr)?
             .map(|v| SubscriptionInfo {
                 level: v.get(0),
                 expires_unix: v.get::<_, f64>(1) as i64,
@@ -234,11 +236,13 @@ impl BinderCore {
             Err(BinderError::UserAlreadyExists)
         } else {
             let mut client = self.get_pg_conn()?;
-            client.execute("insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4)",
+            let mut txn = client.transaction().map_err(to_dberr)?;
+            txn.execute("insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4)",
             &[&username,
             &hash_libsodium_password(password),
             &1000i32,
-            &std::time::SystemTime::now()]).map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            &std::time::SystemTime::now()]).map_err(to_dberr)?;
+            txn.commit().map_err(to_dberr)?;
             Ok(())
         }
     }
@@ -256,9 +260,10 @@ impl BinderCore {
             Err(BinderError::WrongPassword)
         } else {
             let mut client = self.get_pg_conn()?;
-            client
-                .execute("delete from users where username=$1", &[&username])
-                .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            let mut txn = client.transaction().map_err(to_dberr)?;
+            txn.execute("delete from users where username=$1", &[&username])
+                .map_err(to_dberr)?;
+            txn.commit().map_err(to_dberr)?;
             Ok(())
         }
     }
@@ -275,12 +280,13 @@ impl BinderCore {
         } else {
             let new_pwdhash = hash_libsodium_password(new_password);
             let mut client = self.get_pg_conn()?;
-            client
-                .execute(
-                    "update users set pwdhash=$1 where username =$2",
-                    &[&new_pwdhash, &username],
-                )
-                .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            let mut txn = client.transaction().map_err(to_dberr)?;
+            txn.execute(
+                "update users set pwdhash=$1 where username =$2",
+                &[&new_pwdhash, &username],
+            )
+            .map_err(to_dberr)?;
+            txn.commit().map_err(to_dberr)?;
             Ok(())
         }
     }
@@ -354,30 +360,24 @@ impl BinderCore {
     /// count subscriptions
     pub fn count_subscriptions(&self) -> Result<i64, BinderError> {
         let mut conn = self.get_pg_conn()?;
-        let mut txn = conn
-            .transaction()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let mut txn = conn.transaction().map_err(to_dberr)?;
         let sys: i64 = txn
             .query_one("select count(*) from subscriptions;", &[])
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?
+            .map_err(to_dberr)?
             .get(0);
-        txn.commit()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        txn.commit().map_err(to_dberr)?;
         Ok(sys)
     }
 
     /// count subscriptions
     pub fn count_recent_users(&self) -> Result<i64, BinderError> {
         let mut conn = self.get_pg_conn()?;
-        let mut txn = conn
-            .transaction()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let mut txn = conn.transaction().map_err(to_dberr)?;
         let sys: i64 = txn
             .query_one("select count(distinct id) from login_intensity where last_login + '24 hour' > NOW();", &[])
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?
+            .map_err(to_dberr)?
             .get(0);
-        txn.commit()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        txn.commit().map_err(to_dberr)?;
         Ok(sys)
     }
 
@@ -385,15 +385,13 @@ impl BinderCore {
     fn check_login_ratelimit(&self, uid: i32) -> Result<(), BinderError> {
         const MAX_INTENSITY: f32 = 20.0;
         let mut conn = self.get_pg_conn()?;
-        let mut txn = conn
-            .transaction()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let mut txn = conn.transaction().map_err(to_dberr)?;
         let row = txn
             .query_one(
                 "select coalesce(max(intensity), 0.0), coalesce(MAX(last_login), NOW()) from login_intensity where id = $1",
                 &[&uid],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
         let existing_intensity: f32 = row.get(0);
         let existing_time: SystemTime = row.get(1);
         let days_past = existing_time.elapsed().unwrap_or_default().as_secs_f32() / 86400.0;
@@ -406,9 +404,8 @@ impl BinderCore {
             )));
         }
         txn.execute("insert into login_intensity (id, intensity, last_login) values ($1, $2, $3) on conflict (id) do update set intensity = excluded.intensity, last_login = excluded.last_login", 
-        &[&uid, &new_intensity, &SystemTime::now()]).map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
-        txn.commit()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        &[&uid, &new_intensity, &SystemTime::now()]).map_err(to_dberr)?;
+        txn.commit().map_err(to_dberr)?;
         Ok(())
     }
 
@@ -450,9 +447,7 @@ impl BinderCore {
         exit_signature: ed25519_dalek::Signature,
     ) -> Result<(), BinderError> {
         let mut client = self.get_pg_conn()?;
-        let mut txn: postgres::Transaction = client
-            .transaction()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let mut txn: postgres::Transaction = client.transaction().map_err(to_dberr)?;
         // first check the exit signature
         let signing_key = {
             let bts: Vec<u8> = txn
@@ -491,14 +486,13 @@ impl BinderCore {
                 &update_time,
             ],
         )
-        .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        .map_err(to_dberr)?;
         txn.execute(
             "delete from routes where update_time < NOW() - interval '5 minute'",
             &[],
         )
-        .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
-        txn.commit()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        .map_err(to_dberr)?;
+        txn.commit().map_err(to_dberr)?;
         Ok(())
     }
 
@@ -508,9 +502,7 @@ impl BinderCore {
             Ok(res)
         } else {
             let mut client = self.get_pg_conn()?;
-            let mut txn: postgres::Transaction = client
-                .transaction()
-                .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            let mut txn: postgres::Transaction = client.transaction().map_err(to_dberr)?;
             let rows = txn
             .query(
                 if only_free {
@@ -520,7 +512,7 @@ impl BinderCore {
                 },
                 &[],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
             let mut toret = rows
                 .into_iter()
                 .map(|row| ExitDescriptor {
@@ -607,9 +599,7 @@ impl BinderCore {
         }
 
         let mut client = self.get_pg_conn()?;
-        let mut txn: postgres::Transaction<'_> = client
-            .transaction()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let mut txn: postgres::Transaction<'_> = client.transaction().map_err(to_dberr)?;
 
         // if quarantined, we permaban this IP.
         if should_quarantine {
@@ -617,7 +607,7 @@ impl BinderCore {
                 "insert into token_blacklist values ($1) on conflict do nothing",
                 &[&token_id],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
         }
 
         let mut query: String =  "select bridge_address,sosistab_pubkey,bridge_group from routes where update_time > NOW() - interval '3 minute' and hostname=$1 and bridge_group not in (select bridge_group from route_blacklist where hostname=$1)".into();
@@ -630,9 +620,7 @@ impl BinderCore {
 
         let query: &str = &query;
 
-        let mut rows = txn
-            .query(query, &[&exit_hostname])
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        let mut rows = txn.query(query, &[&exit_hostname]).map_err(to_dberr)?;
         // we sort by the keyed hash of the bridge address with the given unblinded digest. This ensures reasonable stability.
         rows.sort_by_key(|row| {
             let addr: String = row.get(0);
@@ -671,39 +659,39 @@ impl BinderCore {
                 "insert into bridge_assignments_new values ($1, $2, $3) on conflict do nothing",
                 &[&token_id, &bridge_ip.to_string(), &SystemTime::now()],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
             txn.execute(
                 "delete from bridge_assignments_new where createtime < NOW() - interval '24 hour'",
                 &[],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
         }
-        txn.commit()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+        txn.commit().map_err(to_dberr)?;
         // fix
         let res = res.into_iter().map(|v| v.0).collect::<Vec<_>>();
-        if !res.is_empty() {
-            self.bridge_cache.insert(
-                (unblinded_digest.to_vec(), exit_hostname.to_string()),
-                res.clone(),
-            );
-        }
+        self.bridge_cache.insert(
+            (unblinded_digest.to_vec(), exit_hostname.to_string()),
+            res.clone(),
+        );
+
         Ok(res)
     }
 
     /// Should I quarantine?
     fn is_black_token(&self, token_id: &str) -> Result<bool, BinderError> {
         let mut client = self.get_pg_conn()?;
-        let row = client
+        let mut txn = client.transaction().map_err(to_dberr)?;
+        let row = txn
             .query_one(
                 "select count(key) from token_blacklist where key=$1",
                 &[&token_id],
             )
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?;
+            .map_err(to_dberr)?;
         let count: i64 = row.get(0);
         if count > 0 {
             log::warn!("{} in token blacklist", token_id);
         }
+        txn.commit().map_err(to_dberr)?;
         Ok(count > 0)
     }
 }
@@ -715,9 +703,7 @@ fn generate_captcha(captcha_service: &str) -> Result<String, BinderError> {
         .timeout(Duration::from_secs(1))
         .call();
     if resp.ok() {
-        Ok(resp
-            .into_string()
-            .map_err(|e| BinderError::DatabaseFailed(e.to_string()))?)
+        Ok(resp.into_string().map_err(to_dberr)?)
     } else {
         Err(BinderError::Other("captcha failed".into()))
     }
@@ -802,4 +788,8 @@ fn hash_libsodium_password(password: &str) -> String {
     assert_eq!(res, 0);
     let cstr = unsafe { CStr::from_ptr(output.as_ptr() as *const i8) };
     cstr.to_str().unwrap().to_owned()
+}
+
+fn to_dberr(e: impl ToString) -> BinderError {
+    BinderError::DatabaseFailed(e.to_string())
 }

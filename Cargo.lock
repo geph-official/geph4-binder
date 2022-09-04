@@ -1489,6 +1489,7 @@ dependencies = [
  "geph4-binder-transport",
  "governor",
  "hex",
+ "itertools",
  "jemallocator-global",
  "libsodium-sys",
  "log",
@@ -1519,9 +1520,9 @@ dependencies = [
 
 [[package]]
 name = "geph4-binder-transport"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5691e672abca40cc5eb7a8074d19551de52d5852d3661ec17d1c1aa6bf90f45"
+checksum = "c52eb7403210e72b1232a369bebc707c14ba1006410cb5f42ca73c6ea7a593f3"
 dependencies = [
  "async-h1",
  "async-tls",
@@ -1801,6 +1802,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5bbe824c507c5da5956355e86a746d82e0e1464f65d862cc5e71da70e94b2c"
 dependencies = [
  "cfg-if 1.0.0",
+]
+
+[[package]]
+name = "itertools"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9a9d19fa1e79b6215ff29b9d6880b706147f16e9b1dbb1e4e5947b5b02bc5e3"
+dependencies = [
+ "either",
 ]
 
 [[package]]

@@ -5,6 +5,8 @@ use env_logger::Env;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use structopt::StructOpt;
 
+const POOL_SIZE: usize = 32;
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     /// PostgreSQL database URL

@@ -1,4 +1,4 @@
-use crate::bindercore::BinderCore;
+use crate::{bindercore::BinderCore, POOL_SIZE};
 use geph4_binder_transport::{BinderError, BinderRequestData, BinderResponse, BinderServer};
 
 use once_cell::sync::Lazy;
@@ -17,12 +17,12 @@ fn db_retry<T>(action: impl Fn() -> Result<T, BinderError>) -> Result<T, BinderE
     for retries in 1.. {
         match action() {
             Err(BinderError::DatabaseFailed(s)) => {
-                if retries > 3 {
+                if retries > 5 {
                     log::warn!("DB retried many times now: {}", s);
                     return Err(BinderError::DatabaseFailed(s));
                 }
-                let sleep_low = 2u64.pow(retries) * 10;
-                let sleep_high = 2u64.pow(retries + 1) * 100;
+                let sleep_low = 2u64.pow(retries);
+                let sleep_high = 2u64.pow(retries + 1) * 10;
                 let actual = rand::thread_rng().gen_range(sleep_low, sleep_high);
                 // if retries > 1 {
                 log::warn!(
@@ -63,7 +63,8 @@ fn handle_request_once(
         .probable_ip()
         .unwrap_or_else(|| Ipv4Addr::from(0).into());
 
-    static POOL: Lazy<ThreadPool> = Lazy::new(|| ThreadPool::new(1, 64, Duration::from_secs(10)));
+    static POOL: Lazy<ThreadPool> =
+        Lazy::new(|| ThreadPool::new(1, POOL_SIZE, Duration::from_secs(10)));
     let submit_time = Instant::now();
     POOL.execute(move || {
         let delay = submit_time.elapsed();
@@ -73,11 +74,16 @@ fn handle_request_once(
             return;
         }
         let dcopy = req.request_data.clone();
-        eprintln!(
-            "{:?} sent us {}",
-            req.probable_ip(),
-            &format!("{:?}", dcopy).tap_mut(|s| s.truncate(20))
-        );
+        let start = Instant::now();
+        let req_ip = req.probable_ip();
+        scopeguard::defer!({
+            log::debug!(
+                "{:?} sent us {:?}; processed in {:?}",
+                req_ip,
+                &format!("{:?}", dcopy).tap_mut(|s| s.truncate(20)),
+                start.elapsed()
+            );
+        });
         let res = match &req.request_data {
             // password change request
             BinderRequestData::ChangePassword {
