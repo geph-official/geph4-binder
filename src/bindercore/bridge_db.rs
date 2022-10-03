@@ -1,14 +1,13 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    net::SocketAddr,
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use geph4_binder_transport::BridgeDescriptor;
 use itertools::Itertools;
 use parking_lot::RwLock;
-use rand::Rng;
 
 use super::PostgresPool;
 
@@ -34,6 +33,8 @@ pub struct BridgeDb {
     bridge_descs: Sh<BridgeStore>,
     // token blacklist
     token_blacklist: Sh<HashSet<String>>,
+    // premium routes
+    route_premium: Sh<HashSet<String>>,
 }
 
 impl BridgeDb {
@@ -41,25 +42,40 @@ impl BridgeDb {
     pub fn new(db_pool: PostgresPool) -> Self {
         let bridge_descs: Sh<BridgeStore> = Default::default();
         let token_blacklist: Sh<HashSet<String>> = Default::default();
+        let route_premium: Sh<HashSet<String>> = Default::default();
         // spawn the bridge updater
         {
             let db_pool = db_pool.clone();
             let bridge_descs = bridge_descs.clone();
             let token_blacklist = token_blacklist.clone();
+            let route_premium = route_premium.clone();
             std::thread::Builder::new()
                 .name("bridge-sync".into())
-                .spawn(|| bridge_updater(db_pool, bridge_descs, token_blacklist))
+                .spawn(|| bridge_updater(db_pool, bridge_descs, token_blacklist, route_premium))
                 .unwrap();
         }
         Self {
             db_pool,
             bridge_descs,
             token_blacklist,
+            route_premium,
         }
     }
 
     /// Obtains a bridge assignment for the given string.
-    pub fn assign_bridges(&self, opaque_id: &str, exit_hostname: &str) -> Vec<BridgeDescriptor> {
+    pub fn assign_bridges(
+        &self,
+        opaque_id: &str,
+        exit_hostname: &str,
+        is_premium: bool,
+    ) -> Vec<BridgeDescriptor> {
+        // if we are blacklisted, then we all get thrown into the same bin in order to not disrupt normal users.
+        let opaque_id = if self.token_blacklist.read().contains(opaque_id) {
+            "!!!BADGUY!!!"
+        } else {
+            opaque_id
+        };
+
         // read all the bridges for this exit out right off the bat
         let by_group = self
             .bridge_descs
@@ -76,14 +92,34 @@ impl BridgeDb {
             })
             .unwrap_or_default();
         // for each group, pick out the "best" one, based on rendezvous hashing
-        by_group
+        let mut res = by_group
             .into_iter()
             .filter_map(|(group, routes)| {
+                if !is_premium && self.route_premium.read().contains(&group) {
+                    return None;
+                }
                 routes.into_iter().max_by_key(|k| {
-                    blake3::hash(format!("{}-{}", k.endpoint, opaque_id).as_bytes()).to_hex()
+                    blake3::hash(format!("{}-{}", k.endpoint.ip(), opaque_id).as_bytes()).to_hex()
                 })
             })
-            .collect_vec()
+            .collect_vec();
+        // TODO something better than this
+        if opaque_id == "!!!BADGUY!!!" {
+            // give out misinformation
+            for desc in res.iter_mut() {
+                let real_ip = desc.endpoint.ip();
+                if let IpAddr::V4(v4) = real_ip {
+                    let [a, b, c, _] = v4.octets();
+                    let fake_v4 = Ipv4Addr::from([a, b, c, a ^ b ^ c]);
+                    desc.endpoint.set_ip(fake_v4.into());
+                }
+            }
+        }
+        log::debug!(
+            "assign_bridges({opaque_id}, {exit_hostname}) => {}",
+            res.len()
+        );
+        res
     }
 }
 
@@ -92,11 +128,15 @@ fn bridge_updater(
     db_pool: PostgresPool,
     bridge_descs: Sh<BridgeStore>,
     token_blacklist: Sh<HashSet<String>>,
+    route_premium: Sh<HashSet<String>>,
 ) {
     let inner = || -> anyhow::Result<()> {
         let mut conn = db_pool.get()?;
         let mut txn = conn.transaction()?;
-        let route_rows = txn.query("select bridge_address,sosistab_pubkey,bridge_group,hostname from routes where update_time > NOW() - interval '3 minute'", &[])?;
+        let route_rows = txn.query(
+            "select bridge_address,sosistab_pubkey,bridge_group,hostname from routes",
+            &[],
+        )?;
         // form the entire hashmap anew
         let mut new_bridge_descs: BridgeStore = HashMap::new();
         for row in route_rows {
@@ -122,17 +162,51 @@ fn bridge_updater(
             let key: String = row.get(0);
             new_token_blacklist.insert(key);
         }
+        let mut new_route_premium = HashSet::new();
+        let route_premium_rows = txn.query("select bridge_group from route_premium", &[])?;
+        for row in route_premium_rows {
+            let key: String = row.get(0);
+            new_route_premium.insert(key);
+        }
+        txn.execute(
+            "delete from bridge_assignments_new where createtime < NOW() - interval '24 hour'",
+            &[],
+        )?;
+        txn.execute(
+            "delete from routes where update_time < NOW() - interval '5 minute'",
+            &[],
+        )?;
         txn.commit()?;
         // replace the hashmaps atomically
         *bridge_descs.write() = new_bridge_descs;
         *token_blacklist.write() = new_token_blacklist;
+        *route_premium.write() = new_route_premium;
         Ok(())
     };
     loop {
+        let start = Instant::now();
         if let Err(err) = inner() {
             log::warn!("bridge_db sync fail: {:?}", err);
+        } else {
+            log::info!("bridge db synced in {:?}", start.elapsed());
         }
         // random sleep duration to prevent patterns from forming
-        std::thread::sleep(Duration::from_secs(rand::thread_rng().gen_range(60, 300)));
+        if !bridge_descs.read().is_empty() {
+            let next_pulse = UNIX_EPOCH
+                + (Duration::from_secs(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        / 60
+                        * 60
+                        + 60,
+                ));
+            let to_sleep = next_pulse
+                .duration_since(SystemTime::now())
+                .unwrap_or_else(|_| Duration::from_secs(1));
+            log::info!("waiting {:?} until next bridge db sync", to_sleep);
+            std::thread::sleep(to_sleep);
+        }
     }
 }

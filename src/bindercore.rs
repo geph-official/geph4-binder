@@ -14,10 +14,10 @@ use r2d2_postgres::PostgresConnectionManager;
 use std::{
     collections::HashMap,
     convert::TryFrom,
-    convert::TryInto,
     ffi::{CStr, CString},
     net::{IpAddr, SocketAddr},
     ops::DerefMut,
+    sync::Arc,
     time::Duration,
     time::SystemTime,
 };
@@ -27,6 +27,8 @@ use crate::{
     POOL_SIZE,
 };
 
+use self::bridge_db::BridgeDb;
+
 type PostgresPool = r2d2::Pool<PostgresConnectionManager<postgres_native_tls::MakeTlsConnector>>;
 
 pub struct BinderCore {
@@ -34,10 +36,13 @@ pub struct BinderCore {
     mizaru_sk: Mutex<HashMap<String, mizaru::SecretKey>>,
 
     // caches
-    bridge_cache: Cache<(Vec<u8>, String), Vec<BridgeDescriptor>>,
+    bridge_cache: Cache<(String, String), Vec<BridgeDescriptor>>,
     exit_cache: Cache<bool, Vec<ExitDescriptor>>,
     pwd_cache: Cache<(String, String), bool>,
     validate_cache: Cache<blake3::Hash, bool>,
+
+    // bridge DB
+    bridge_db: BridgeDb,
 
     // reporter
     reporter: GfwReportClient,
@@ -60,6 +65,10 @@ impl BinderCore {
             .unwrap();
         let connector = MakeTlsConnector::new(connector);
         let manager = PostgresConnectionManager::new(database_url.parse().unwrap(), connector);
+        let conn_pool = r2d2::Builder::new()
+            .max_size(POOL_SIZE as _)
+            .build(manager)
+            .unwrap();
         BinderCore {
             captcha_service: captcha_service_url.to_string(),
             mizaru_sk: Mutex::new(HashMap::new()),
@@ -69,7 +78,7 @@ impl BinderCore {
                 .build(),
             bridge_cache: Cache::builder()
                 .max_capacity(100000)
-                .time_to_live(Duration::from_secs(4000))
+                .time_to_live(Duration::from_secs(60))
                 .build(),
             validate_cache: Cache::builder()
                 .max_capacity(10000)
@@ -79,13 +88,11 @@ impl BinderCore {
                 .time_to_live(Duration::from_secs(60))
                 .build(),
 
+            bridge_db: BridgeDb::new(conn_pool.clone()),
+
             reporter: GfwReportClient::new(gfwreport_addr),
 
-            conn_pool: r2d2::Builder::new()
-                .max_size(POOL_SIZE as _)
-                .connection_timeout(Duration::from_secs(1))
-                .build(manager)
-                .unwrap(),
+            conn_pool,
         }
     }
 
@@ -119,9 +126,21 @@ impl BinderCore {
         }
 
         let mut mizaru_sk = self.mizaru_sk.lock();
+
         if let Some(sk) = mizaru_sk.get(acct_level) {
             return Ok(sk.clone());
         }
+
+        // try to read from the local cache first
+        let cachefile_location = format!("/etc/mizaru-cache-{}.key", acct_level);
+        if let Ok(key) = std::fs::read(&cachefile_location) {
+            if let Ok(key) = bincode::deserialize(&key) {
+                let key: mizaru::SecretKey = key;
+                mizaru_sk.insert(acct_level.into(), key.clone());
+                return Ok(key);
+            }
+        }
+
         let key_name = format!("mizaru-master-sk-{}", acct_level);
         let mut client = self.get_pg_conn()?;
         let mut txn = client.transaction().map_err(to_dberr)?;
@@ -133,6 +152,7 @@ impl BinderCore {
                 let res: mizaru::SecretKey =
                     bincode::deserialize(row.get(0)).expect("must deserialize mizaru-master-sk");
                 mizaru_sk.insert(acct_level.into(), res.clone());
+                let _ = std::fs::write(cachefile_location, bincode::serialize(&res).unwrap());
                 Ok(res)
             }
             None => {
@@ -487,11 +507,6 @@ impl BinderCore {
             ],
         )
         .map_err(to_dberr)?;
-        txn.execute(
-            "delete from routes where update_time < NOW() - interval '5 minute'",
-            &[],
-        )
-        .map_err(to_dberr)?;
         txn.commit().map_err(to_dberr)?;
         Ok(())
     }
@@ -542,18 +557,9 @@ impl BinderCore {
         exit_hostname: &str,
     ) -> Result<Vec<BridgeDescriptor>, BinderError> {
         // First we authenticate
-        let key = self.get_mizaru_sk(level)?.to_public_key();
-        if !key.blind_verify(unblinded_digest, unblinded_signature) {
+        if !self.validate(level, unblinded_digest, unblinded_signature)? {
             log::warn!("invalid digest in get_bridges! {}", probable_ip);
             return Err(BinderError::Other("mizaru failed".into()));
-        }
-
-        // Then, we check the bridge cache
-        let existent = self
-            .bridge_cache
-            .get(&(unblinded_digest.to_vec(), exit_hostname.to_string()));
-        if let Some(res) = existent {
-            return Ok(res);
         }
 
         let token_id = hex::encode(blake3::hash(unblinded_digest).as_bytes())[0..16].to_string();
@@ -561,120 +567,139 @@ impl BinderCore {
             ip: probable_ip.to_string(),
             key: token_id.clone(),
         });
-        let should_quarantine = {
-            // let tracker = self.tracker.read();
-            // if tracker.is_banned_key(UserKey::TokenHash(token_id.clone())) {
-            //     log::warn!("saw BANNED KEY {} at tracker: {}:", token_id, probable_ip);
-            //     true
-            // } else if tracker.is_banned_ip(probable_ip) {
-            //     log::warn!("saw SUSPICIOUS IP at tracker: {}", probable_ip);
-            //     false
-            // } else
-            if self.is_black_token(&token_id)? {
-                log::warn!(
-                    "saw MANUALLY BANNED TOKEN ({}) at tracker with IP {}",
-                    token_id,
-                    probable_ip
-                );
-                true
-            } else {
-                false
-            }
-        };
-        // if should_quarantine && country_code() == "TM" {
-        //     log::warn!("RESCINDING ban due to Turkmenistan!");
-        //     should_quarantine = false;
-        // }
 
-        // "silently" quarantine
-        if should_quarantine {
-            log::warn!(
-                "quarantine activated for token {}, IP address {}",
-                token_id,
-                probable_ip
-            );
-        }
-        if !self.validate(level, unblinded_digest, unblinded_signature)? {
-            return Err(BinderError::NoUserFound);
-        }
-
-        let mut client = self.get_pg_conn()?;
-        let mut txn: postgres::Transaction<'_> = client.transaction().map_err(to_dberr)?;
-
-        // if quarantined, we permaban this IP.
-        if should_quarantine {
-            txn.query(
-                "insert into token_blacklist values ($1) on conflict do nothing",
-                &[&token_id],
-            )
-            .map_err(to_dberr)?;
-        }
-
-        let mut query: String =  "select bridge_address,sosistab_pubkey,bridge_group from routes where update_time > NOW() - interval '3 minute' and hostname=$1 and bridge_group not in (select bridge_group from route_blacklist where hostname=$1)".into();
-        if should_quarantine {
-            query += " and bridge_group in (select bridge_group from route_quarantine)"
-        }
-        if level == "free" {
-            query += " and bridge_group not in (select bridge_group from route_premium)"
-        }
-
-        let query: &str = &query;
-
-        let mut rows = txn.query(query, &[&exit_hostname]).map_err(to_dberr)?;
-        // we sort by the keyed hash of the bridge address with the given unblinded digest. This ensures reasonable stability.
-        rows.sort_by_key(|row| {
-            let addr: String = row.get(0);
-            *blake3::keyed_hash(
-                blake3::hash(unblinded_digest).as_bytes(),
-                addr.split(':').next().unwrap().as_bytes(),
-            )
-            .as_bytes()
-        });
-        let mut res: Vec<_> = rows
-            .into_iter()
-            .map(|row| {
-                let bridge_address: String = row.get(0);
-                let bridge_address: SocketAddr = bridge_address.parse().unwrap();
-                let sosistab_key: Vec<u8> = row.get(1);
-                let sosistab_key: [u8; 32] = sosistab_key.as_slice().try_into().unwrap();
-                let sosistab_key = x25519_dalek::PublicKey::from(sosistab_key);
-                let group: String = row.get(2);
-                (
-                    BridgeDescriptor {
-                        endpoint: bridge_address,
-                        sosistab_key,
-                    },
-                    group,
-                )
-            })
-            .collect();
-        res.sort_by(|a, b| a.1.cmp(&b.1));
-        res.dedup_by(|a, b| a.1 == b.1);
-        log::debug!("serving out {} bridges", res.len());
-
-        // we insert these into the assignment records
-        for (bridge, _) in res.iter() {
-            let bridge_ip = bridge.endpoint.ip();
-            txn.query(
+        self.bridge_cache
+            .try_get_with((token_id.clone(), exit_hostname.to_string()), || {
+                // we insert these into the assignment records
+                let res = self
+                    .bridge_db
+                    .assign_bridges(&token_id, exit_hostname, level == "plus");
+                if res.is_empty() {
+                    return Err(BinderError::Other("bridge refresh failed".into()));
+                }
+                let mut conn = self.get_pg_conn().map_err(to_dberr)?;
+                let mut txn = conn.transaction().map_err(to_dberr)?;
+                for bridge in res.iter() {
+                    let bridge_ip = bridge.endpoint.ip();
+                    txn.query(
                 "insert into bridge_assignments_new values ($1, $2, $3) on conflict do nothing",
                 &[&token_id, &bridge_ip.to_string(), &SystemTime::now()],
             )
             .map_err(to_dberr)?;
-            txn.execute(
-                "delete from bridge_assignments_new where createtime < NOW() - interval '24 hour'",
-                &[],
-            )
-            .map_err(to_dberr)?;
-        }
-        txn.commit().map_err(to_dberr)?;
-        // fix
-        let res = res.into_iter().map(|v| v.0).collect::<Vec<_>>();
-        self.bridge_cache.insert(
-            (unblinded_digest.to_vec(), exit_hostname.to_string()),
-            res.clone(),
-        );
+                }
+                txn.commit().map_err(to_dberr)?;
 
-        Ok(res)
+                Ok(res)
+            })
+            .map_err(|e: Arc<BinderError>| e.as_ref().clone())
+
+        // // Then, we check the bridge cache
+        // let existent = self
+        //     .bridge_cache
+        //     .get(&(unblinded_digest.to_vec(), exit_hostname.to_string()));
+        // if let Some(res) = existent {
+        //     return Ok(res);
+        // }
+
+        // let should_quarantine = {
+        //     // let tracker = self.tracker.read();
+        //     // if tracker.is_banned_key(UserKey::TokenHash(token_id.clone())) {
+        //     //     log::warn!("saw BANNED KEY {} at tracker: {}:", token_id, probable_ip);
+        //     //     true
+        //     // } else if tracker.is_banned_ip(probable_ip) {
+        //     //     log::warn!("saw SUSPICIOUS IP at tracker: {}", probable_ip);
+        //     //     false
+        //     // } else
+        //     if self.is_black_token(&token_id)? {
+        //         log::warn!(
+        //             "saw MANUALLY BANNED TOKEN ({}) at tracker with IP {}",
+        //             token_id,
+        //             probable_ip
+        //         );
+        //         true
+        //     } else {
+        //         false
+        //     }
+        // };
+        // // if should_quarantine && country_code() == "TM" {
+        // //     log::warn!("RESCINDING ban due to Turkmenistan!");
+        // //     should_quarantine = false;
+        // // }
+
+        // // "silently" quarantine
+        // if should_quarantine {
+        //     log::warn!(
+        //         "quarantine activated for token {}, IP address {}",
+        //         token_id,
+        //         probable_ip
+        //     );
+        // }
+        // if !self.validate(level, unblinded_digest, unblinded_signature)? {
+        //     return Err(BinderError::NoUserFound);
+        // }
+
+        // let mut client = self.get_pg_conn()?;
+        // let mut txn: postgres::Transaction<'_> = client.transaction().map_err(to_dberr)?;
+
+        // // if quarantined, we permaban this IP.
+        // if should_quarantine {
+        //     txn.query(
+        //         "insert into token_blacklist values ($1) on conflict do nothing",
+        //         &[&token_id],
+        //     )
+        //     .map_err(to_dberr)?;
+        // }
+
+        // let mut query: String =  "select bridge_address,sosistab_pubkey,bridge_group from routes where update_time > NOW() - interval '3 minute' and hostname=$1 and bridge_group not in (select bridge_group from route_blacklist where hostname=$1)".into();
+        // if should_quarantine {
+        //     query += " and bridge_group in (select bridge_group from route_quarantine)"
+        // }
+        // if level == "free" {
+        //     query += " and bridge_group not in (select bridge_group from route_premium)"
+        // }
+
+        // let query: &str = &query;
+
+        // let mut rows = txn.query(query, &[&exit_hostname]).map_err(to_dberr)?;
+        // // we sort by the keyed hash of the bridge address with the given unblinded digest. This ensures reasonable stability.
+        // rows.sort_by_key(|row| {
+        //     let addr: String = row.get(0);
+        //     *blake3::keyed_hash(
+        //         blake3::hash(unblinded_digest).as_bytes(),
+        //         addr.split(':').next().unwrap().as_bytes(),
+        //     )
+        //     .as_bytes()
+        // });
+        // let mut res: Vec<_> = rows
+        //     .into_iter()
+        //     .map(|row| {
+        //         let bridge_address: String = row.get(0);
+        //         let bridge_address: SocketAddr = bridge_address.parse().unwrap();
+        //         let sosistab_key: Vec<u8> = row.get(1);
+        //         let sosistab_key: [u8; 32] = sosistab_key.as_slice().try_into().unwrap();
+        //         let sosistab_key = x25519_dalek::PublicKey::from(sosistab_key);
+        //         let group: String = row.get(2);
+        //         (
+        //             BridgeDescriptor {
+        //                 endpoint: bridge_address,
+        //                 sosistab_key,
+        //             },
+        //             group,
+        //         )
+        //     })
+        //     .collect();
+        // res.sort_by(|a, b| a.1.cmp(&b.1));
+        // res.dedup_by(|a, b| a.1 == b.1);
+        // log::debug!("serving out {} bridges", res.len());
+
+        // // fix
+        // let res = res.into_iter().map(|v| v.0).collect::<Vec<_>>();
+        // self.bridge_cache.insert(
+        //     (unblinded_digest.to_vec(), exit_hostname.to_string()),
+        //     res.clone(),
+        // );
+
+        // Ok(res)
     }
 
     /// Should I quarantine?
