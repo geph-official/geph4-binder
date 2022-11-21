@@ -207,6 +207,8 @@ fn bridge_updater(
                 .unwrap_or_else(|_| Duration::from_secs(1));
             log::info!("waiting {:?} until next bridge db sync", to_sleep);
             std::thread::sleep(to_sleep);
+        } else {
+            std::thread::sleep(Duration::from_secs(10));
         }
     }
 }

@@ -40,6 +40,7 @@ pub struct BinderCore {
     exit_cache: Cache<bool, Vec<ExitDescriptor>>,
     pwd_cache: Cache<(String, String), bool>,
     validate_cache: Cache<blake3::Hash, bool>,
+    epoch_key_cache: Cache<(String, usize), rsa::RSAPublicKey>,
 
     // bridge DB
     bridge_db: BridgeDb,
@@ -87,6 +88,7 @@ impl BinderCore {
             exit_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(60))
                 .build(),
+            epoch_key_cache: Cache::new(1000),
 
             bridge_db: BridgeDb::new(conn_pool.clone()),
 
@@ -132,7 +134,7 @@ impl BinderCore {
         }
 
         // try to read from the local cache first
-        let cachefile_location = format!("/etc/mizaru-cache-{}.key", acct_level);
+        let cachefile_location = format!("/tmp/mizaru-cache-{}.key", acct_level);
         if let Ok(key) = std::fs::read(&cachefile_location) {
             if let Ok(key) = bincode::deserialize(&key) {
                 let key: mizaru::SecretKey = key;
@@ -317,9 +319,16 @@ impl BinderCore {
         level: &str,
         epoch: usize,
     ) -> Result<rsa::RSAPublicKey, BinderError> {
-        let lala = self.get_mizaru_sk(level)?;
-        let sk = lala.get_subkey(epoch);
-        Ok(sk.to_public_key())
+        if let Some(v) = self.epoch_key_cache.get(&(level.to_string(), epoch)) {
+            Ok(v)
+        } else {
+            let lala = self.get_mizaru_sk(level)?;
+            let sk = lala.get_subkey(epoch);
+            let v = sk.to_public_key();
+            self.epoch_key_cache
+                .insert((level.to_string(), epoch), v.clone());
+            Ok(v)
+        }
     }
 
     /// Validates the username and password, and if it is valid, blind-sign the given digest and return the signature.
@@ -403,6 +412,7 @@ impl BinderCore {
 
     /// checks whether the login violated the rate limit.
     fn check_login_ratelimit(&self, uid: i32) -> Result<(), BinderError> {
+        return Ok(()); // TODO temporarily get rid of the rate limit
         const MAX_INTENSITY: f32 = 20.0;
         let mut conn = self.get_pg_conn()?;
         let mut txn = conn.transaction().map_err(to_dberr)?;
