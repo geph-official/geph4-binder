@@ -1,6 +1,8 @@
 mod antigfw;
 mod bindercore;
+mod bindercore_v2;
 mod responder;
+use async_compat::CompatExt;
 use async_trait::async_trait;
 use bindercore::BinderCore;
 use bytes::Bytes;
@@ -11,12 +13,13 @@ use geph4_protocol::binder::protocol::{
     BlindToken, BridgeDescriptor, Captcha, ExitDescriptor, Level, MasterSummary, MiscFatalError,
     RegisterError, SubscriptionInfo, UserInfo,
 };
-use nanorpc::RpcService;
+use nanorpc::{JrpcRequest, RpcService};
 use once_cell::sync::Lazy;
 use rusty_pool::ThreadPool;
 use smol_str::SmolStr;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
+use warp::Filter;
 const POOL_SIZE: usize = 16;
 
 #[derive(Debug, StructOpt)]
@@ -44,79 +47,105 @@ struct Opt {
     statsd_addr: SocketAddr,
 }
 
-fn main() {
-    env_logger::Builder::from_env(Env::default().default_filter_or("geph4_binder=info")).init();
-    let opt = Opt::from_args();
-    let binder_core = bindercore::BinderCore::create(
-        &opt.database,
-        &opt.captcha_endpoint,
-        &std::fs::read(opt.database_ca_cert).unwrap(),
-        opt.gfwreport_addr,
-    );
-    let master_secret = binder_core.get_master_sk().unwrap();
-    let free_mizaru_sk = binder_core.get_mizaru_sk("free").unwrap();
-    let plus_mizaru_sk = binder_core.get_mizaru_sk("plus").unwrap();
-    log::info!("geph4-binder starting with:");
-    log::info!(
-        "  Master x25519 public key = {}",
-        hex::encode(x25519_dalek::PublicKey::from(&master_secret).to_bytes())
-    );
-    log::info!(
-        "  Mizaru public key (FREE) = {}",
-        hex::encode(free_mizaru_sk.to_public_key().0)
-    );
-    log::info!(
-        "  Mizaru public key (PLUS) = {}",
-        hex::encode(plus_mizaru_sk.to_public_key().0)
-    );
-    let statsd_client = statsd::Client::new(opt.statsd_addr, "geph4.binder").unwrap();
-    // create server
-    let copp = statsd::Client::new(opt.statsd_addr, "geph4.binder").unwrap();
-    let http_serv =
-        geph4_binder_transport::HttpServer::new(opt.listen_http, master_secret, move |time| {
-            copp.timer("latency", time.as_secs_f64())
-        });
-    log::info!("LEGACY HTTP listening on {}", opt.listen_http);
-    let bcore = Arc::new(binder_core);
-    {
-        let bcore = bcore.clone();
-        std::thread::spawn(move || {
-            log::info!("NEW HTTP listening on {}", opt.listen_new);
-            handle_requests_new(tiny_http::Server::http(opt.listen_new).unwrap(), bcore)
-        });
-    }
-    responder::handle_requests(http_serv, bcore, Arc::new(statsd_client))
-}
+fn main() -> anyhow::Result<()> {
+    smolscale::block_on(async {
+        env_logger::Builder::from_env(Env::default().default_filter_or("geph4_binder=info")).init();
+        let opt = Opt::from_args();
 
-fn handle_requests_new(server: tiny_http::Server, bcore: Arc<BinderCore>) {
-    let sk = bcore.get_master_sk().unwrap();
-    let bcw = BinderCoreWrapper(bcore);
-    for mut request in server.incoming_requests() {
-        let bcw = BinderService(bcw.clone());
-        let my_sk = sk.clone();
-        smolscale::spawn(async move {
-            let mut s = Vec::new();
-            request.as_reader().read_to_end(&mut s)?;
-            log::debug!("** new msg of {} bts", s.len());
-            let (decrypted, their_pk) = box_decrypt(&s, my_sk.clone())?;
-            log::debug!("** new msg of {} bts decrypted", s.len());
-            let resp = bcw.respond_raw(serde_json::from_slice(&decrypted)?).await;
-            let resp = serde_json::to_vec(&resp)?;
-            let resp = box_encrypt(&resp, my_sk, their_pk);
-            let _ = request.respond(tiny_http::Response::from_data(resp));
-            anyhow::Ok(())
-        })
-        .detach()
-    }
-}
+        let core_v2 = bindercore_v2::BinderCoreV2::connect(
+            &opt.database,
+            &opt.captcha_endpoint,
+            &std::fs::read(&opt.database_ca_cert)?,
+        )
+        .await?;
 
+        log::info!("core v2 initialized");
+
+        let binder_core = bindercore::BinderCore::create(
+            &opt.database,
+            &opt.captcha_endpoint,
+            &std::fs::read(opt.database_ca_cert).unwrap(),
+            opt.gfwreport_addr,
+        );
+        let master_secret = binder_core.get_master_sk().unwrap();
+        let free_mizaru_sk = binder_core.get_mizaru_sk("free").unwrap();
+        let plus_mizaru_sk = binder_core.get_mizaru_sk("plus").unwrap();
+        log::info!("geph4-binder starting with:");
+        log::info!(
+            "  Master x25519 public key = {}",
+            hex::encode(x25519_dalek::PublicKey::from(&master_secret).to_bytes())
+        );
+        log::info!(
+            "  Mizaru public key (FREE) = {}",
+            hex::encode(free_mizaru_sk.to_public_key().0)
+        );
+        log::info!(
+            "  Mizaru public key (PLUS) = {}",
+            hex::encode(plus_mizaru_sk.to_public_key().0)
+        );
+        let statsd_client = Arc::new(statsd::Client::new(opt.statsd_addr, "geph4.binder").unwrap());
+        // create server
+        let copp = statsd::Client::new(opt.statsd_addr, "geph4.binder").unwrap();
+        let http_serv =
+            geph4_binder_transport::HttpServer::new(opt.listen_http, master_secret, move |time| {
+                copp.timer("latency", time.as_secs_f64())
+            });
+        log::info!("LEGACY HTTP listening on {}", opt.listen_http);
+        let bcore = Arc::new(binder_core);
+        {
+            let bcore = bcore.clone();
+            let bcw = BinderCoreWrapper {
+                core: bcore.clone(),
+            };
+            let statsd_client = statsd_client.clone();
+            std::thread::spawn(move || {
+                log::info!("NEW HTTP listening on {}", opt.listen_new);
+                let sk = bcore.get_master_sk().unwrap();
+                let bcw = Arc::new(BinderService(bcw.clone()));
+                let my_sk = sk.clone();
+                let statsd_client = statsd_client.clone();
+                let serve = warp::post()
+                    .and(warp::body::content_length_limit(1024 * 512))
+                    .and(warp::body::bytes())
+                    .then(move |s: bytes::Bytes| {
+                        let my_sk = my_sk.clone();
+                        let bcw = bcw.clone();
+                        let statsd_client = statsd_client.clone();
+                        async move {
+                            let fallible = async {
+                                let (decrypted, their_pk) = box_decrypt(&s, my_sk.clone())?;
+                                let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
+                                log::debug!("** new msg {} of {} bts", req.method, s.len());
+                                statsd_client.incr(&req.method);
+                                let resp = bcw.respond_raw(req).await;
+                                let resp = serde_json::to_vec(&resp)?;
+                                let resp = box_encrypt(&resp, my_sk, their_pk);
+                                anyhow::Ok(resp)
+                            };
+                            if let Ok(res) = fallible.await {
+                                res.to_vec()
+                            } else {
+                                Bytes::new().to_vec()
+                            }
+                        }
+                    });
+
+                smol::future::block_on(warp::serve(serve).run(opt.listen_new).compat())
+            });
+        }
+        responder::handle_requests(http_serv, bcore, statsd_client);
+        Ok(())
+    })
+}
 #[derive(Clone)]
-struct BinderCoreWrapper(Arc<BinderCore>);
+struct BinderCoreWrapper {
+    core: Arc<BinderCore>,
+}
 
 #[async_trait]
 impl BinderProtocol for BinderCoreWrapper {
     async fn authenticate(&self, auth_req: AuthRequest) -> Result<AuthResponse, AuthError> {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || {
             let (user_info, blind_signature) = this
                 .authenticate(
@@ -145,7 +174,7 @@ impl BinderProtocol for BinderCoreWrapper {
 
     async fn validate(&self, token: BlindToken) -> bool {
         loop {
-            let this = self.0.clone();
+            let this = self.core.clone();
             let token = token.clone();
             let res = run_blocking(move || {
                 let res = if let Ok(v) = bincode::deserialize(&token.unblinded_signature_bincode) {
@@ -164,7 +193,7 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     async fn get_captcha(&self) -> Result<Captcha, MiscFatalError> {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || {
             let (s, v) = this
                 .get_captcha()
@@ -184,7 +213,7 @@ impl BinderProtocol for BinderCoreWrapper {
         captcha_id: SmolStr,
         captcha_soln: SmolStr,
     ) -> Result<(), RegisterError> {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || {
             this.create_user(&username, &password, &captcha_id, &captcha_soln)
                 .map_err(|e| match e {
@@ -198,12 +227,12 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     async fn delete_user(&self, username: SmolStr, password: SmolStr) -> Result<(), AuthError> {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || this.delete_user(&username, &password).map_err(to_autherr)).await
     }
 
     async fn add_bridge_route(&self, descriptor: BridgeDescriptor) -> Result<(), MiscFatalError> {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || {
             this.add_bridge_route(
                 descriptor.sosistab_key,
@@ -220,7 +249,7 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     async fn get_summary(&self) -> MasterSummary {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || loop {
             let fallible_part = || {
                 let all_exits = this.get_exits(false)?;
@@ -265,7 +294,7 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     async fn get_bridges(&self, token: BlindToken, exit: SmolStr) -> Vec<BridgeDescriptor> {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || {
             if let Ok(bridges) = this.get_bridges(
                 "0.0.0.0".parse().unwrap(),
@@ -299,7 +328,7 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     async fn get_mizaru_pk(&self, level: Level) -> mizaru::PublicKey {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || {
             this.get_mizaru_sk(lvl_to_str(level))
                 .unwrap()
@@ -309,7 +338,7 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     async fn get_mizaru_epoch_key(&self, level: Level, epoch: u16) -> rsa::RSAPublicKey {
-        let this = self.0.clone();
+        let this = self.core.clone();
         run_blocking(move || this.get_epoch_key(lvl_to_str(level), epoch as _).unwrap()).await
     }
 }
