@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     ffi::{CStr, CString},
     str::FromStr,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -48,6 +49,9 @@ pub struct BinderCoreV2 {
 
     // Postgres
     postgres: PgPool,
+
+    // stats client
+    statsd_client: Arc<statsd::Client>,
 }
 
 impl BinderCoreV2 {
@@ -56,6 +60,7 @@ impl BinderCoreV2 {
         database_url: &str,
         captcha_service_url: &str,
         cert: &[u8],
+        statsd_client: Arc<statsd::Client>,
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
             .max_connections(POOL_SIZE as _)
@@ -84,6 +89,7 @@ impl BinderCoreV2 {
                 .build(),
 
             postgres,
+            statsd_client,
         })
     }
 
@@ -383,6 +389,15 @@ impl BinderCoreV2 {
         }
 
         // TODO rate limiting
+
+        let mut txn = self.postgres.begin().await?;
+        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2) on conflict (id) do update set last_login = excluded.last_login").bind(user_info.userid).bind(Utc::now().naive_utc()).execute(&mut txn).await?;
+        let (count,): (i64,) =
+            sqlx::query_as("select count(id) from auth_logs where last_login + '1 day' > NOW()")
+                .fetch_one(&mut txn)
+                .await?;
+        self.statsd_client.gauge("usercount", count as f64);
+        txn.commit().await?;
 
         let sig = key.blind_sign(auth_req.epoch as usize, &auth_req.blinded_digest);
         Ok(Ok(AuthResponse {

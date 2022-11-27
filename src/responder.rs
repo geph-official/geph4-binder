@@ -116,8 +116,7 @@ fn handle_request_once(
                 )?;
                 let sub_count = core.count_subscriptions()?;
                 statsd_client.gauge("subcount", sub_count as f64);
-                let recent_users = core.count_recent_users()?;
-                statsd_client.gauge("usercount", recent_users as f64);
+
                 statsd_client.incr("Authenticate");
                 Ok(BinderResponse::AuthenticateResp {
                     user_info,

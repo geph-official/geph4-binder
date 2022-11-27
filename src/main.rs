@@ -17,7 +17,7 @@ use geph4_protocol::binder::protocol::{
 use nanorpc::{JrpcRequest, RpcService};
 
 use smol_str::SmolStr;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use structopt::StructOpt;
 use warp::Filter;
 const POOL_SIZE: usize = 16;
@@ -52,19 +52,10 @@ fn main() -> anyhow::Result<()> {
         env_logger::Builder::from_env(Env::default().default_filter_or("geph4_binder=info")).init();
         let opt = Opt::from_args();
 
-        let core_v2 = bindercore_v2::BinderCoreV2::connect(
-            &opt.database,
-            &opt.captcha_endpoint,
-            &std::fs::read(&opt.database_ca_cert)?,
-        )
-        .await?;
-
-        log::info!("core v2 initialized");
-
         let binder_core = bindercore::BinderCore::create(
             &opt.database,
             &opt.captcha_endpoint,
-            &std::fs::read(opt.database_ca_cert).unwrap(),
+            &std::fs::read(&opt.database_ca_cert).unwrap(),
             opt.gfwreport_addr,
         );
         let master_secret = binder_core.get_master_sk().unwrap();
@@ -84,6 +75,15 @@ fn main() -> anyhow::Result<()> {
             hex::encode(plus_mizaru_sk.to_public_key().0)
         );
         let statsd_client = Arc::new(statsd::Client::new(opt.statsd_addr, "geph4.binder").unwrap());
+        let core_v2 = bindercore_v2::BinderCoreV2::connect(
+            &opt.database,
+            &opt.captcha_endpoint,
+            &std::fs::read(&opt.database_ca_cert)?,
+            statsd_client.clone(),
+        )
+        .await?;
+
+        log::info!("core v2 initialized");
         // create server
         let copp = statsd::Client::new(opt.statsd_addr, "geph4.binder").unwrap();
         let http_serv =
@@ -113,10 +113,16 @@ fn main() -> anyhow::Result<()> {
                         async move {
                             let fallible = async {
                                 let (decrypted, their_pk) = box_decrypt(&s, my_sk.clone())?;
+                                let start = Instant::now();
                                 let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
                                 log::debug!("** new msg {} of {} bts", req.method, s.len());
                                 statsd_client.incr(&req.method);
+                                let method = req.method.clone();
                                 let resp = bcw.respond_raw(req).await;
+                                statsd_client.timer(
+                                    &format!("latencyv2.{}", method),
+                                    start.elapsed().as_secs_f64(),
+                                );
                                 let resp = serde_json::to_vec(&resp)?;
                                 let resp = box_encrypt(&resp, my_sk, their_pk);
                                 anyhow::Ok(resp)
@@ -132,6 +138,7 @@ fn main() -> anyhow::Result<()> {
                 smol::future::block_on(warp::serve(serve).run(opt.listen_new).compat())
             });
         }
+
         responder::handle_requests(http_serv, bcore, statsd_client);
         Ok(())
     })
