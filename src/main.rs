@@ -1,23 +1,23 @@
-mod antigfw;
 mod bindercore;
 mod bindercore_v2;
 mod responder;
 use async_compat::CompatExt;
 use async_trait::async_trait;
-use bindercore::BinderCore;
+use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
+
+use bindercore_v2::BinderCoreV2;
 use bytes::Bytes;
 use env_logger::Env;
-use geph4_binder_transport::BinderError;
+use futures_lite::Future;
+
 use geph4_protocol::binder::protocol::{
     box_decrypt, box_encrypt, AuthError, AuthRequest, AuthResponse, BinderProtocol, BinderService,
-    BlindToken, BridgeDescriptor, Captcha, ExitDescriptor, Level, MasterSummary, MiscFatalError,
-    RegisterError, SubscriptionInfo, UserInfo,
+    BlindToken, BridgeDescriptor, Captcha, Level, MasterSummary, MiscFatalError, RegisterError,
 };
 use nanorpc::{JrpcRequest, RpcService};
-use once_cell::sync::Lazy;
-use rusty_pool::ThreadPool;
+
 use smol_str::SmolStr;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use structopt::StructOpt;
 use warp::Filter;
 const POOL_SIZE: usize = 16;
@@ -95,14 +95,13 @@ fn main() -> anyhow::Result<()> {
         {
             let bcore = bcore.clone();
             let bcw = BinderCoreWrapper {
-                core: bcore.clone(),
+                core_v2: Arc::new(core_v2),
             };
             let statsd_client = statsd_client.clone();
             std::thread::spawn(move || {
                 log::info!("NEW HTTP listening on {}", opt.listen_new);
-                let sk = bcore.get_master_sk().unwrap();
+                let my_sk = bcore.get_master_sk().unwrap();
                 let bcw = Arc::new(BinderService(bcw.clone()));
-                let my_sk = sk.clone();
                 let statsd_client = statsd_client.clone();
                 let serve = warp::post()
                     .and(warp::body::content_length_limit(1024 * 512))
@@ -139,71 +138,21 @@ fn main() -> anyhow::Result<()> {
 }
 #[derive(Clone)]
 struct BinderCoreWrapper {
-    core: Arc<BinderCore>,
+    core_v2: Arc<BinderCoreV2>,
 }
 
 #[async_trait]
 impl BinderProtocol for BinderCoreWrapper {
     async fn authenticate(&self, auth_req: AuthRequest) -> Result<AuthResponse, AuthError> {
-        let this = self.core.clone();
-        run_blocking(move || {
-            let (user_info, blind_signature) = this
-                .authenticate(
-                    "0.0.0.0".parse().unwrap(),
-                    &auth_req.username,
-                    &auth_req.password,
-                    lvl_to_str(auth_req.level),
-                    auth_req.epoch as usize,
-                    &auth_req.blinded_digest,
-                )
-                .map_err(to_autherr)?;
-            Ok(AuthResponse {
-                user_info: UserInfo {
-                    userid: user_info.userid,
-                    username: user_info.username.into(),
-                    subscription: user_info.subscription.map(|sub| SubscriptionInfo {
-                        level: str_to_level(&sub.level),
-                        expires_unix: sub.expires_unix,
-                    }),
-                },
-                blind_signature_bincode: bincode::serialize(&blind_signature).unwrap().into(),
-            })
-        })
-        .await
+        backoff(|| self.core_v2.authenticate(&auth_req)).await
     }
 
     async fn validate(&self, token: BlindToken) -> bool {
-        loop {
-            let this = self.core.clone();
-            let token = token.clone();
-            let res = run_blocking(move || {
-                let res = if let Ok(v) = bincode::deserialize(&token.unblinded_signature_bincode) {
-                    v
-                } else {
-                    return Ok(false);
-                };
-                this.validate(lvl_to_str(token.level), &token.unblinded_digest, &res)
-            })
-            .await;
-            match res {
-                Err(e) => log::warn!("{:?}", e),
-                Ok(b) => return b,
-            }
-        }
+        self.core_v2.validate(token.clone()).await
     }
 
     async fn get_captcha(&self) -> Result<Captcha, MiscFatalError> {
-        let this = self.core.clone();
-        run_blocking(move || {
-            let (s, v) = this
-                .get_captcha()
-                .map_err(|e| MiscFatalError::BadNet(format!("{:?}", e).into()))?;
-            Ok(Captcha {
-                captcha_id: s.into(),
-                png_data: v.into(),
-            })
-        })
-        .await
+        Ok(backoff(|| self.core_v2.get_captcha()).await)
     }
 
     async fn register_user(
@@ -213,166 +162,53 @@ impl BinderProtocol for BinderCoreWrapper {
         captcha_id: SmolStr,
         captcha_soln: SmolStr,
     ) -> Result<(), RegisterError> {
-        let this = self.core.clone();
-        run_blocking(move || {
-            this.create_user(&username, &password, &captcha_id, &captcha_soln)
-                .map_err(|e| match e {
-                    geph4_binder_transport::BinderError::UserAlreadyExists => {
-                        RegisterError::DuplicateUsername
-                    }
-                    e => RegisterError::Other(format!("{:?}", e).into()),
-                })
+        backoff(|| {
+            self.core_v2
+                .create_user(&username, &password, &captcha_id, &captcha_soln)
         })
         .await
     }
 
     async fn delete_user(&self, username: SmolStr, password: SmolStr) -> Result<(), AuthError> {
-        let this = self.core.clone();
-        run_blocking(move || this.delete_user(&username, &password).map_err(to_autherr)).await
+        backoff(|| self.core_v2.delete_user(&username, &password)).await
     }
 
     async fn add_bridge_route(&self, descriptor: BridgeDescriptor) -> Result<(), MiscFatalError> {
-        let this = self.core.clone();
-        run_blocking(move || {
-            this.add_bridge_route(
-                descriptor.sosistab_key,
-                descriptor.endpoint,
-                &descriptor.alloc_group,
-                &descriptor.exit_hostname,
-                descriptor.update_time,
-                ed25519_dalek::Signature::from_bytes(&descriptor.exit_signature)
-                    .map_err(|e| MiscFatalError::Database(format!("{:?}", e).into()))?,
-            )
-            .map_err(|e| MiscFatalError::Database(format!("{:?}", e).into()))
-        })
-        .await
+        self.core_v2
+            .add_bridge_route(descriptor)
+            .await
+            .map_err(|e| MiscFatalError::Database(e.to_string().into()))
     }
 
     async fn get_summary(&self) -> MasterSummary {
-        let this = self.core.clone();
-        run_blocking(move || loop {
-            let fallible_part = || {
-                let all_exits = this.get_exits(false)?;
-                let free_exits = this.get_exits(true)?;
-                let mut vv = vec![];
-                for legacy_exit in all_exits {
-                    let allowed_levels = if free_exits
-                        .iter()
-                        .any(|s| s.hostname == legacy_exit.hostname)
-                    {
-                        vec![Level::Free, Level::Plus]
-                    } else {
-                        vec![Level::Plus]
-                    };
-                    let new = ExitDescriptor {
-                        hostname: legacy_exit.hostname.into(),
-                        signing_key: legacy_exit.signing_key,
-                        country_code: legacy_exit.country_code.into(),
-                        city_code: legacy_exit.city_code.into(),
-                        direct_routes: vec![],
-                        legacy_direct_sosistab_pk: legacy_exit.sosistab_key,
-                        allowed_levels,
-                    };
-                    vv.push(new);
-                }
-                Ok::<_, BinderError>(vv)
-            };
-            match fallible_part() {
-                Ok(val) => {
-                    return MasterSummary {
-                        exits: val,
-                        bad_countries: vec!["cn".into(), "ir".into()],
-                    }
-                }
-                Err(err) => {
-                    log::warn!("retrying due to {:?}", err);
-                    std::thread::sleep(Duration::from_millis(fastrand::u64(0..50)));
-                }
-            }
-        })
-        .await
+        backoff(|| self.core_v2.get_summary()).await
     }
 
     async fn get_bridges(&self, token: BlindToken, exit: SmolStr) -> Vec<BridgeDescriptor> {
-        let this = self.core.clone();
-        run_blocking(move || {
-            if let Ok(bridges) = this.get_bridges(
-                "0.0.0.0".parse().unwrap(),
-                lvl_to_str(token.level),
-                &token.unblinded_digest,
-                &if let Ok(v) = bincode::deserialize(&token.unblinded_signature_bincode) {
-                    v
-                } else {
-                    return vec![];
-                },
-                &exit,
-            ) {
-                bridges
-                    .into_iter()
-                    .map(|legacy| BridgeDescriptor {
-                        is_direct: false,
-                        protocol: "sosistab".into(),
-                        endpoint: legacy.endpoint,
-                        sosistab_key: legacy.sosistab_key,
-                        exit_hostname: exit.clone(),
-                        alloc_group: "unknown".into(),
-                        update_time: 0,
-                        exit_signature: Bytes::copy_from_slice(b"fake"),
-                    })
-                    .collect()
-            } else {
-                vec![]
-            }
-        })
-        .await
+        backoff(|| self.core_v2.get_bridges(token.clone(), exit.clone())).await
     }
 
     async fn get_mizaru_pk(&self, level: Level) -> mizaru::PublicKey {
-        let this = self.core.clone();
-        run_blocking(move || {
-            this.get_mizaru_sk(lvl_to_str(level))
-                .unwrap()
-                .to_public_key()
-        })
-        .await
+        self.core_v2.get_mizaru_sk(level).await.to_public_key()
     }
 
     async fn get_mizaru_epoch_key(&self, level: Level, epoch: u16) -> rsa::RSAPublicKey {
-        let this = self.core.clone();
-        run_blocking(move || this.get_epoch_key(lvl_to_str(level), epoch as _).unwrap()).await
+        self.core_v2.get_epoch_key(level, epoch as usize).await
     }
 }
 
-fn lvl_to_str(l: Level) -> &'static str {
-    match l {
-        Level::Free => "free",
-        Level::Plus => "plus",
+async fn backoff<T, Fut: Future<Output = anyhow::Result<T>>>(mut f: impl FnMut() -> Fut) -> T {
+    let mut backoff = ExponentialBackoffBuilder::new()
+        .with_max_elapsed_time(None)
+        .build();
+    loop {
+        match f().await {
+            Ok(res) => return res,
+            Err(err) => {
+                let interval = backoff.next_backoff().unwrap();
+                log::warn!("retrying in {:?} due to {:?}", interval, err);
+                smol::Timer::after(interval).await;
+            }
+        }
     }
-}
-
-fn str_to_level(s: &str) -> Level {
-    match s {
-        "free" => Level::Free,
-        _ => Level::Plus,
-    }
-}
-
-fn to_autherr(e: BinderError) -> AuthError {
-    match e {
-        geph4_binder_transport::BinderError::WrongPassword
-        | geph4_binder_transport::BinderError::NoUserFound => AuthError::InvalidUsernameOrPassword,
-        geph4_binder_transport::BinderError::WrongLevel => AuthError::WrongLevel,
-        e => AuthError::Other(format!("{:?}", e).into()),
-    }
-}
-
-async fn run_blocking<T: Send + Sync + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    static POOL: Lazy<ThreadPool> =
-        Lazy::new(|| ThreadPool::new(1, POOL_SIZE, Duration::from_secs(10)));
-    let (mut send, recv) = async_oneshot::oneshot();
-    POOL.execute(move || {
-        let t = f();
-        let _ = send.send(t);
-    });
-    recv.await.unwrap()
 }

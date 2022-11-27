@@ -8,10 +8,10 @@ use std::{
 use anyhow::Context;
 use async_compat::CompatExt;
 use bytes::Bytes;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::{future::Shared, FutureExt};
-use geph4_binder_transport::BinderError;
+
 use geph4_protocol::binder::protocol::{
     AuthError, AuthRequest, AuthResponse, BlindToken, BridgeDescriptor, Captcha, ExitDescriptor,
     Level, MasterSummary, RegisterError, SubscriptionInfo, UserInfo,
@@ -62,6 +62,7 @@ impl BinderCoreV2 {
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
                 PgConnectOptions::from_str(database_url)?
+                    .statement_cache_capacity(0) // pgbouncer compat
                     .ssl_mode(PgSslMode::VerifyFull)
                     .ssl_root_cert_from_pem(cert.to_vec()),
             )
@@ -87,9 +88,10 @@ impl BinderCoreV2 {
     }
 
     /// Obtains the master x25519 key.
-    pub async fn get_master_sk(&self) -> Result<x25519_dalek::StaticSecret, sqlx::Error> {
+    pub async fn get_master_sk(&self) -> anyhow::Result<x25519_dalek::StaticSecret> {
+        let mut txn = self.postgres.begin().await?;
         let val: (Vec<u8>,) = sqlx::query_as("select value from secrets where key = 'MASTER'")
-            .fetch_one(&self.postgres)
+            .fetch_one(&mut txn)
             .await?;
         Ok(bincode::deserialize(&val.0).expect("cannot deserialize master SK"))
     }
@@ -119,10 +121,11 @@ impl BinderCoreV2 {
                         Level::Free => "mizaru-master-sk-free",
                         Level::Plus => "mizaru-master-sk-plus",
                     };
+                    let mut txn = postgres.begin().await.expect("cannot start txn");
                     let row: Option<(Vec<u8>,)> =
                         sqlx::query_as("select value from secrets where key = $1")
                             .bind(key_name)
-                            .fetch_optional(&postgres)
+                            .fetch_optional(&mut txn)
                             .await
                             .expect("cannot reach db for keys");
                     match row {
@@ -146,6 +149,18 @@ impl BinderCoreV2 {
         fut_handle.await
     }
 
+    /// Get a per-epoch key.
+    pub async fn get_epoch_key(&self, level: Level, epoch: usize) -> rsa::RSAPublicKey {
+        if let Some(v) = self.epoch_key_cache.get(&(level, epoch)) {
+            v
+        } else {
+            let mizaru_sk = self.get_mizaru_sk(level).await;
+            let public = mizaru_sk.get_subkey(epoch).to_public_key();
+            self.epoch_key_cache.insert((level, epoch), public.clone());
+            public
+        }
+    }
+
     /// Creates a new user, consuming a captcha answer.
     pub async fn create_user(
         &self,
@@ -164,7 +179,7 @@ impl BinderCoreV2 {
         }
         let mut txn = self.postgres.begin().await?;
         sqlx::query(
-            "insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4",
+            "insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4)",
         )
         .bind(username)
         .bind(hash_libsodium_password(password).await)
@@ -246,10 +261,11 @@ impl BinderCoreV2 {
             Ok(summary)
         } else {
             let mut txn = self.postgres.begin().await?;
-            let qresult: Vec<(String, [u8; 32], String, String, [u8; 32], bool)> =
-                sqlx::query_as("select hostname,signing_key,country,city,sosistab_key,plus")
-                    .fetch_all(&mut txn)
-                    .await?;
+            let qresult: Vec<(String, [u8; 32], String, String, [u8; 32], bool)> = sqlx::query_as(
+                "select hostname,signing_key,country,city,sosistab_key,plus from exits",
+            )
+            .fetch_all(&mut txn)
+            .await?;
             let exits = qresult
                 .into_iter()
                 .map(|row| {
@@ -282,14 +298,17 @@ impl BinderCoreV2 {
         exit: SmolStr,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
         let opaque_id = blake3::hash(&bincode::serialize(&token).unwrap());
-        // TODO validation
+        if !self.validate(token).await {
+            log::warn!("got invalid token in get_bridges");
+            return Ok(vec![]);
+        }
         // first, we get *all* the bridges that belong to this exit. this is not particularly efficient, but that's somewhat okay
         let mut all_bridges = {
             if let Some(bunch) = self.bridge_per_exit_cache.get(&exit) {
                 bunch
             } else {
                 let mut txn = self.postgres.begin().await?;
-                let rows: Vec<(String, [u8; 32], String, String, i64)> = sqlx::query_as("select hostname, sosistab_pubkey, bridge_address, bridge_group, (extract epoch from update_time) from routes where hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
+                let rows: Vec<(String, [u8; 32], String, String, f64)> = sqlx::query_as("select hostname, sosistab_pubkey, bridge_address, bridge_group, extract(epoch from update_time) from routes where hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
                 let result: Vec<BridgeDescriptor> = rows
                     .into_iter()
                     .map(
@@ -344,7 +363,7 @@ impl BinderCoreV2 {
     /// Validates the username and password.
     pub async fn authenticate(
         &self,
-        auth_req: AuthRequest,
+        auth_req: &AuthRequest,
     ) -> anyhow::Result<Result<AuthResponse, AuthError>> {
         let user_info = if let Some(user_info) = self.get_user_info(&auth_req.username).await? {
             user_info

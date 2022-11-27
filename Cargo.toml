@@ -67,6 +67,7 @@ dirs = "4.0.0"
 reqwest = "0.11.13"
 num_cpus = "1.14.0"
 imbl = "2.0.0"
+backoff = "0.4.0"
 
 [profile.release]
 panic = 'abort'

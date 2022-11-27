@@ -22,10 +22,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::{
-    antigfw::{GfwReportClient, Report},
-    POOL_SIZE,
-};
+use crate::POOL_SIZE;
 
 use self::bridge_db::BridgeDb;
 
@@ -44,9 +41,6 @@ pub struct BinderCore {
 
     // bridge DB
     bridge_db: BridgeDb,
-
-    // reporter
-    reporter: GfwReportClient,
 
     // postgres pool
     conn_pool: PostgresPool,
@@ -91,8 +85,6 @@ impl BinderCore {
             epoch_key_cache: Cache::new(1000),
 
             bridge_db: BridgeDb::new(conn_pool.clone()),
-
-            reporter: GfwReportClient::new(gfwreport_addr),
 
             conn_pool,
         }
@@ -371,13 +363,6 @@ impl BinderCore {
         // we only ratelimit here, to prevent incorrect login attempts from being counted
         self.check_login_ratelimit(user_info.userid)?;
 
-        // report to the gfw daemon
-        // check
-        self.reporter.send(Report::IpUid {
-            ip: probable_ip.to_string(),
-            uid: user_info.userid as _,
-        });
-
         if (real_epoch as i32 - epoch as i32).abs() <= 1 {
             let sig = key.blind_sign(epoch, blinded_digest);
             Ok((user_info, sig))
@@ -573,10 +558,6 @@ impl BinderCore {
         }
 
         let token_id = hex::encode(blake3::hash(unblinded_digest).as_bytes())[0..16].to_string();
-        self.reporter.send(Report::IpKey {
-            ip: probable_ip.to_string(),
-            key: token_id.clone(),
-        });
 
         self.bridge_cache
             .try_get_with((token_id.clone(), exit_hostname.to_string()), || {
