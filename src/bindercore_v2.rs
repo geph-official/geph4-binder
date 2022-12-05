@@ -271,7 +271,7 @@ impl BinderCoreV2 {
         sqlx::query("insert into routes (hostname, sosistab_pubkey, bridge_address, bridge_group, update_time) values ($1, $2, $3, $4, $5) on conflict (bridge_address) do
         update set hostname = excluded.hostname, sosistab_pubkey = excluded.sosistab_pubkey, bridge_group = excluded.bridge_group, update_time = excluded.update_time")
         .bind(bridge.exit_hostname.as_str())
-        .bind(bridge.sosistab_key.to_bytes().to_vec())
+        .bind(bridge.sosistab_key.to_vec())
         .bind(bridge.endpoint.to_string())
         .bind(format!("{}!!{}", bridge.alloc_group, bridge.protocol))
         .bind(DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(bridge.update_time)).naive_utc())
@@ -338,7 +338,7 @@ impl BinderCoreV2 {
                 bunch
             } else {
                 let mut txn = self.postgres.begin().await?;
-                let rows: Vec<(String, [u8; 32], String, String, f64)> = sqlx::query_as("select hostname, sosistab_pubkey, bridge_address, bridge_group, extract(epoch from update_time) from routes where hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
+                let rows: Vec<(String, Vec<u8>, String, String, f64)> = sqlx::query_as("select hostname, sosistab_pubkey, bridge_address, bridge_group, extract(epoch from update_time) from routes where hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
                 let result: Vec<BridgeDescriptor> = rows
                     .into_iter()
                     .map(
@@ -353,7 +353,7 @@ impl BinderCoreV2 {
                                 endpoint: bridge_address
                                     .parse()
                                     .expect("unparseable bridge address"),
-                                sosistab_key: x25519_dalek::PublicKey::from(sosistab_pubkey),
+                                sosistab_key: sosistab_pubkey.into(),
                                 exit_hostname: hostname.into(),
                                 alloc_group: if let Some((left, _)) = bridge_group.split_once("!!")
                                 {
