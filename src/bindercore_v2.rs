@@ -41,11 +41,18 @@ pub struct BinderCoreV2 {
     summary_cache: Cache<(), MasterSummary>,
     // caches the correct password of a user. prevents DoS attacks
     pwd_cache: Cache<SmolStr, SmolStr>,
+    // caches the entire req/resp of authentications.
+    auth_cache: Cache<AuthRequest, AuthResponse>,
     // caches the per-epoch key
     epoch_key_cache: Cache<(Level, usize), rsa::RSAPublicKey>,
 
     // caches bridges *per exit*
     bridge_per_exit_cache: Cache<SmolStr, Vec<BridgeDescriptor>>,
+    // caches bridges *per key*
+    bridge_per_key: Cache<blake3::Hash, Vec<BridgeDescriptor>>,
+
+    // caches the "premium routes"
+    premium_route_cache: Cache<(), imbl::HashSet<SmolStr>>,
 
     // Postgres
     postgres: PgPool,
@@ -67,7 +74,6 @@ impl BinderCoreV2 {
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
                 PgConnectOptions::from_str(database_url)?
-                    .statement_cache_capacity(0) // pgbouncer compat
                     .ssl_mode(PgSslMode::VerifyFull)
                     .ssl_root_cert_from_pem(cert.to_vec()),
             )
@@ -80,12 +86,23 @@ impl BinderCoreV2 {
                 .time_to_live(Duration::from_secs(10))
                 .build(),
             pwd_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(60))
+                .time_to_live(Duration::from_secs(3600))
+                .max_capacity(100000)
+                .build(),
+            auth_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(3600))
                 .max_capacity(100000)
                 .build(),
             epoch_key_cache: Cache::new(10000),
             bridge_per_exit_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(60))
+                .time_to_live(Duration::from_secs(120))
+                .build(),
+            bridge_per_key: Cache::builder()
+                .time_to_live(Duration::from_secs(300))
+                .build(),
+
+            premium_route_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(120))
                 .build(),
 
             postgres,
@@ -175,6 +192,8 @@ impl BinderCoreV2 {
         captcha_id: &str,
         captcha_soln: &str,
     ) -> anyhow::Result<Result<(), RegisterError>> {
+        // // EMERGENCY
+        // return Ok(Err(RegisterError::Other("too many requests".into())));
         if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
             log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
             return Ok(Err(RegisterError::Other("incorrect captcha".into())));
@@ -185,7 +204,7 @@ impl BinderCoreV2 {
         }
         let mut txn = self.postgres.begin().await?;
         sqlx::query(
-            "insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4)",
+            "insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4) on conflict do nothing",
         )
         .bind(username)
         .bind(hash_libsodium_password(password).await)
@@ -290,10 +309,12 @@ impl BinderCoreV2 {
                     }
                 })
                 .collect_vec();
-            Ok(MasterSummary {
+            let summ = MasterSummary {
                 exits,
                 bad_countries: vec!["cn".into(), "ir".into()],
-            })
+            };
+            self.summary_cache.insert((), summ.clone());
+            Ok(summ)
         }
     }
 
@@ -304,7 +325,10 @@ impl BinderCoreV2 {
         exit: SmolStr,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
         let opaque_id = blake3::hash(&bincode::serialize(&token).unwrap());
-        if !self.validate(token).await {
+        if let Some(bridges) = self.bridge_per_key.get(&opaque_id) {
+            return Ok(bridges);
+        }
+        if !self.validate(token.clone()).await {
             log::warn!("got invalid token in get_bridges");
             return Ok(vec![]);
         }
@@ -347,6 +371,20 @@ impl BinderCoreV2 {
                 result
             }
         };
+        let premium_routes = if let Some(routes) = self.premium_route_cache.get(&()) {
+            routes
+        } else {
+            let premium_routes: Vec<(String,)> =
+                sqlx::query_as("select bridge_group from route_premium")
+                    .fetch_all(&self.postgres)
+                    .await?;
+            let premium_routes: imbl::HashSet<SmolStr> = premium_routes
+                .into_iter()
+                .map(|s| SmolStr::from(s.0.as_str()))
+                .collect();
+            self.premium_route_cache.insert((), premium_routes.clone());
+            premium_routes
+        };
         // sort by rendezvous hashing
         all_bridges.sort_unstable_by_key(|bridge| {
             *blake3::keyed_hash(
@@ -359,10 +397,13 @@ impl BinderCoreV2 {
         let mut seen = HashSet::new();
         let mut gathered = vec![];
         for bridge in all_bridges {
-            if seen.insert((bridge.alloc_group.clone(), bridge.protocol.clone())) {
+            if (token.level == Level::Plus || !premium_routes.contains(bridge.alloc_group.as_str()))
+                && seen.insert((bridge.alloc_group.clone(), bridge.protocol.clone()))
+            {
                 gathered.push(bridge);
             }
         }
+        self.bridge_per_key.insert(opaque_id, gathered.clone());
         Ok(gathered)
     }
 
@@ -371,11 +412,26 @@ impl BinderCoreV2 {
         &self,
         auth_req: &AuthRequest,
     ) -> anyhow::Result<Result<AuthResponse, AuthError>> {
+        if let Some(val) = self.auth_cache.get(auth_req) {
+            return Ok(Ok(val));
+        }
+
         let user_info = if let Some(user_info) = self.get_user_info(&auth_req.username).await? {
             user_info
         } else {
             return Ok(Err(AuthError::InvalidUsernameOrPassword));
         };
+
+        if user_info
+            .subscription
+            .as_ref()
+            .map(|s| s.level)
+            .unwrap_or(Level::Free)
+            != auth_req.level
+        {
+            return Ok(Err(AuthError::WrongLevel));
+        }
+
         if !self
             .verify_password(&auth_req.username, &auth_req.password)
             .await?
@@ -400,10 +456,12 @@ impl BinderCoreV2 {
         txn.commit().await?;
 
         let sig = key.blind_sign(auth_req.epoch as usize, &auth_req.blinded_digest);
-        Ok(Ok(AuthResponse {
+        let response = AuthResponse {
             user_info,
             blind_signature_bincode: bincode::serialize(&sig).unwrap().into(),
-        }))
+        };
+        self.auth_cache.insert(auth_req.clone(), response.clone());
+        Ok(Ok(response))
     }
 
     /// Validates a token
@@ -429,10 +487,16 @@ impl BinderCoreV2 {
             return Ok(true);
         }
         let mut txn = self.postgres.begin().await?;
-        let (pwdhash,): (String,) = sqlx::query_as("select pwdhash from users where username = $1")
-            .bind(username)
-            .fetch_one(&mut txn)
-            .await?;
+        let (pwdhash,): (String,) = if let Some(v) =
+            sqlx::query_as("select pwdhash from users where username = $1")
+                .bind(username)
+                .fetch_optional(&mut txn)
+                .await?
+        {
+            v
+        } else {
+            return Ok(false);
+        };
         if verify_libsodium_password(password.to_string(), pwdhash).await {
             self.pwd_cache.insert(username.into(), password.into());
             Ok(true)
@@ -543,8 +607,8 @@ async fn hash_libsodium_password(password: &str) -> String {
                 output.as_mut_ptr() as *mut i8,
                 password.as_ptr() as *const i8,
                 password.len() as u64,
-                libsodium_sys::crypto_pwhash_OPSLIMIT_INTERACTIVE as u64,
-                libsodium_sys::crypto_pwhash_MEMLIMIT_INTERACTIVE as usize,
+                libsodium_sys::crypto_pwhash_OPSLIMIT_INTERACTIVE as u64 / 2,
+                libsodium_sys::crypto_pwhash_MEMLIMIT_INTERACTIVE as usize / 2,
             )
         };
         assert_eq!(res, 0);

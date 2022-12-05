@@ -564,7 +564,7 @@ impl BinderCore {
                 // we insert these into the assignment records
                 let res = self
                     .bridge_db
-                    .assign_bridges(&token_id, exit_hostname, level == "plus");
+                    .assign_bridges(&token_id, exit_hostname, false);
                 if res.is_empty() {
                     return Err(BinderError::Other("bridge refresh failed".into()));
                 }

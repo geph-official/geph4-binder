@@ -202,7 +202,7 @@ fn handle_request_once(
             } => db_retry(|| {
                 let resp = core.get_bridges(
                     probable_ip,
-                    "free",
+                    level,
                     unblinded_digest,
                     unblinded_signature,
                     exit_hostname,

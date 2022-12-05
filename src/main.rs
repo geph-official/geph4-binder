@@ -17,10 +17,15 @@ use geph4_protocol::binder::protocol::{
 use nanorpc::{JrpcRequest, RpcService};
 
 use smol_str::SmolStr;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use structopt::StructOpt;
 use warp::Filter;
-const POOL_SIZE: usize = 16;
+const POOL_SIZE: usize = 8;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
@@ -115,7 +120,6 @@ fn main() -> anyhow::Result<()> {
                                 let (decrypted, their_pk) = box_decrypt(&s, my_sk.clone())?;
                                 let start = Instant::now();
                                 let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
-                                log::debug!("** new msg {} of {} bts", req.method, s.len());
                                 statsd_client.incr(&req.method);
                                 let method = req.method.clone();
                                 let resp = bcw.respond_raw(req).await;
@@ -123,6 +127,14 @@ fn main() -> anyhow::Result<()> {
                                     &format!("latencyv2.{}", method),
                                     start.elapsed().as_secs_f64(),
                                 );
+                                if start.elapsed() > Duration::from_secs(1) {
+                                    log::debug!(
+                                        "** req {} of {} bts responded in {:.2}ms",
+                                        method,
+                                        s.len(),
+                                        start.elapsed().as_secs_f64() * 1000.0
+                                    );
+                                }
                                 let resp = serde_json::to_vec(&resp)?;
                                 let resp = box_encrypt(&resp, my_sk, their_pk);
                                 anyhow::Ok(resp)
