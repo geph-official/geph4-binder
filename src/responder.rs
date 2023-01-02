@@ -77,12 +77,14 @@ fn handle_request_once(
         let start = Instant::now();
         let req_ip = req.probable_ip();
         scopeguard::defer!({
-            log::debug!(
-                "{:?} sent us {:?}; processed in {:?}",
-                req_ip,
-                &format!("{:?}", dcopy).tap_mut(|s| s.truncate(20)),
-                start.elapsed()
-            );
+            if start.elapsed() > Duration::from_secs(2) {
+                log::debug!(
+                    "{:?} sent us {:?}; processed in {:?}",
+                    req_ip,
+                    &format!("{:?}", dcopy).tap_mut(|s| s.truncate(20)),
+                    start.elapsed()
+                );
+            }
         });
         let res = match &req.request_data {
             // password change request

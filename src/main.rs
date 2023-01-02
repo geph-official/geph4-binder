@@ -196,7 +196,10 @@ impl BinderProtocol for BinderCoreWrapper {
         self.core_v2
             .add_bridge_route(descriptor)
             .await
-            .map_err(|e| MiscFatalError::Database(e.to_string().into()))
+            .map_err(|e| {
+                log::error!("FATAL error adding bridges: {:?}", e);
+                MiscFatalError::Database(e.to_string().into())
+            })
     }
 
     async fn get_summary(&self) -> MasterSummary {
@@ -204,7 +207,19 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     async fn get_bridges(&self, token: BlindToken, exit: SmolStr) -> Vec<BridgeDescriptor> {
-        backoff(|| self.core_v2.get_bridges(token.clone(), exit.clone())).await
+        backoff(|| self.core_v2.get_bridges(token.clone(), exit.clone(), true))
+            .await
+            .into_iter()
+            .filter(|s| s.protocol == "sosistab")
+            .collect()
+    }
+
+    async fn get_bridges_v2(&self, token: BlindToken, exit: SmolStr) -> Vec<BridgeDescriptor> {
+        backoff(|| self.core_v2.get_bridges(token.clone(), exit.clone(), true))
+            .await
+            .into_iter()
+            .filter(|s| s.protocol != "sosistab")
+            .collect()
     }
 
     async fn get_mizaru_pk(&self, level: Level) -> mizaru::PublicKey {

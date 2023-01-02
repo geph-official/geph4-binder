@@ -95,10 +95,10 @@ impl BinderCoreV2 {
                 .build(),
             epoch_key_cache: Cache::new(10000),
             bridge_per_exit_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(120))
+                .time_to_live(Duration::from_secs(30))
                 .build(),
             bridge_per_key: Cache::builder()
-                .time_to_live(Duration::from_secs(300))
+                .time_to_live(Duration::from_secs(30))
                 .build(),
 
             premium_route_cache: Cache::builder()
@@ -257,10 +257,14 @@ impl BinderCoreV2 {
         let signed_msg =
             bincode::serialize(&bridge.clone().tap_mut(|d| d.exit_signature = Bytes::new()))
                 .unwrap();
-        signing_exit.signing_key.verify_strict(
-            &signed_msg,
-            &ed25519_dalek::Signature::from_bytes(&bridge.exit_signature)?,
-        )?;
+        log::debug!("to verify: {}", hex::encode(&signed_msg));
+        signing_exit
+            .signing_key
+            .verify_strict(
+                &signed_msg,
+                &ed25519_dalek::Signature::from_bytes(&bridge.exit_signature)?,
+            )
+            .context(format!("cannot verify signature for bridge {:?}", bridge))?;
         // we check that the time is okay
         if bridge.update_time + 1000 < (SystemTime::now().duration_since(UNIX_EPOCH)?).as_secs() {
             anyhow::bail!("too old")
@@ -273,7 +277,7 @@ impl BinderCoreV2 {
         .bind(bridge.exit_hostname.as_str())
         .bind(bridge.sosistab_key.to_vec())
         .bind(bridge.endpoint.to_string())
-        .bind(format!("{}!!{}", bridge.alloc_group, bridge.protocol))
+        .bind(format!("{}!!{}", if bridge.is_direct{"direct"} else {&bridge.alloc_group}, bridge.protocol))
         .bind(DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(bridge.update_time)).naive_utc())
         .execute(&mut txn).await?;
         txn.commit().await?;
@@ -285,11 +289,10 @@ impl BinderCoreV2 {
         if let Some(summary) = self.summary_cache.get(&()) {
             Ok(summary)
         } else {
-            let mut txn = self.postgres.begin().await?;
             let qresult: Vec<(String, [u8; 32], String, String, [u8; 32], bool)> = sqlx::query_as(
                 "select hostname,signing_key,country,city,sosistab_key,plus from exits",
             )
-            .fetch_all(&mut txn)
+            .fetch_all(&self.postgres)
             .await?;
             let exits = qresult
                 .into_iter()
@@ -309,6 +312,9 @@ impl BinderCoreV2 {
                     }
                 })
                 .collect_vec();
+            // for exit in exits.iter_mut() {
+            //     exit.direct_routes = self.get_self_bridges(&exit.hostname).await?;
+            // }
             let summ = MasterSummary {
                 exits,
                 bad_countries: vec!["cn".into(), "ir".into()],
@@ -323,12 +329,16 @@ impl BinderCoreV2 {
         &self,
         token: BlindToken,
         exit: SmolStr,
+        validate: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
         let opaque_id = blake3::hash(&bincode::serialize(&token).unwrap());
-        if let Some(bridges) = self.bridge_per_key.get(&opaque_id) {
+        if let Some(bridges) = self
+            .bridge_per_key
+            .get(&blake3::keyed_hash(opaque_id.as_bytes(), exit.as_bytes()))
+        {
             return Ok(bridges);
         }
-        if !self.validate(token.clone()).await {
+        if !self.validate(token.clone()).await && validate {
             log::warn!("got invalid token in get_bridges");
             return Ok(vec![]);
         }
@@ -343,8 +353,14 @@ impl BinderCoreV2 {
                     .into_iter()
                     .map(
                         |(hostname, sosistab_pubkey, bridge_address, bridge_group, update_time)| {
+                            let alloc_group: SmolStr =
+                                if let Some((left, _)) = bridge_group.split_once("!!") {
+                                    left.into()
+                                } else {
+                                    bridge_group.clone().into()
+                                };
                             BridgeDescriptor {
-                                is_direct: false,
+                                is_direct: alloc_group == "direct",
                                 protocol: if let Some((_, right)) = bridge_group.split_once("!!") {
                                     right.into()
                                 } else {
@@ -355,12 +371,7 @@ impl BinderCoreV2 {
                                     .expect("unparseable bridge address"),
                                 sosistab_key: sosistab_pubkey.into(),
                                 exit_hostname: hostname.into(),
-                                alloc_group: if let Some((left, _)) = bridge_group.split_once("!!")
-                                {
-                                    left.into()
-                                } else {
-                                    bridge_group.into()
-                                },
+                                alloc_group,
                                 update_time: update_time as u64,
                                 exit_signature: Bytes::new(), // it's not like the client actually checks this lol
                             }
@@ -447,12 +458,30 @@ impl BinderCoreV2 {
         // TODO rate limiting
 
         let mut txn = self.postgres.begin().await?;
-        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2) on conflict (id) do update set last_login = excluded.last_login").bind(user_info.userid).bind(Utc::now().naive_utc()).execute(&mut txn).await?;
-        let (count,): (i64,) =
-            sqlx::query_as("select count(id) from auth_logs where last_login + '1 day' > NOW()")
-                .fetch_one(&mut txn)
-                .await?;
-        self.statsd_client.gauge("usercount", count as f64);
+        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
+            .bind(user_info.userid)
+            .bind(Utc::now().naive_utc())
+            .execute(&mut txn)
+            .await?;
+
+        let (login_count,): (i64,) = sqlx::query_as(
+                "select count (*) from (select distinct last_login from auth_logs where id = $1 and last_login + '1 day' > NOW()) as temp",
+            )
+            .bind(user_info.userid)
+            .fetch_one(&mut txn)
+            .await?;
+        if login_count > 30 {
+            return Ok(Err(AuthError::TooManyRequests));
+        }
+
+        if fastrand::f64() < 0.01 {
+            let (count,): (i64,) = sqlx::query_as(
+                "select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'",
+            )
+            .fetch_one(&mut txn)
+            .await?;
+            self.statsd_client.gauge("usercount", count as f64);
+        }
         txn.commit().await?;
 
         let sig = key.blind_sign(auth_req.epoch as usize, &auth_req.blinded_digest);

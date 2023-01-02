@@ -115,10 +115,7 @@ impl BridgeDb {
                 }
             }
         }
-        log::debug!(
-            "assign_bridges({opaque_id}, {exit_hostname}) => {}",
-            res.len()
-        );
+
         res
     }
 }
@@ -134,7 +131,7 @@ fn bridge_updater(
         let mut conn = db_pool.get()?;
         let mut txn = conn.transaction()?;
         let route_rows = txn.query(
-            "select bridge_address,sosistab_pubkey,bridge_group,hostname from routes",
+            "select bridge_address,sosistab_pubkey,bridge_group,hostname from routes where bridge_group not like '%sosistab2%'",
             &[],
         )?;
         // form the entire hashmap anew
@@ -173,7 +170,7 @@ fn bridge_updater(
             &[],
         )?;
         txn.execute(
-            "delete from routes where update_time < NOW() - interval '5 minute'",
+            "delete from routes where update_time < NOW() - interval '3 minute'",
             &[],
         )?;
         txn.commit()?;
