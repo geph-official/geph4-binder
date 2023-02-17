@@ -13,17 +13,22 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::{future::Shared, FutureExt};
 
-use geph4_protocol::binder::protocol::{
-    AuthError, AuthRequest, AuthResponse, BlindToken, BridgeDescriptor, Captcha, ExitDescriptor,
-    Level, MasterSummary, RegisterError, SubscriptionInfo, UserInfo,
+use geph4_protocol::{
+    binder::protocol::{
+        AuthError, AuthRequest, AuthResponse, BlindToken, BridgeDescriptor, Captcha,
+        ExitDescriptor, Level, MasterSummary, RegisterError, SubscriptionInfo, UserInfo,
+    },
+    bridge_exit::{BridgeExitClient, BridgeExitTransport},
 };
 use itertools::Itertools;
 use moka::sync::Cache;
 use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use rusty_pool::ThreadPool;
+use semver::Version;
 use smol::Task;
 use smol_str::SmolStr;
+use smol_timeout::TimeoutExt;
 use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
@@ -54,6 +59,10 @@ pub struct BinderCoreV2 {
     // caches the "premium routes"
     premium_route_cache: Cache<(), imbl::HashSet<SmolStr>>,
 
+    bridge_secret_cache: Cache<(), Vec<u8>>,
+
+    announcements_cache: Cache<(), String>,
+
     // Postgres
     postgres: PgPool,
 
@@ -83,7 +92,7 @@ impl BinderCoreV2 {
             mizaru_sk: Default::default(),
 
             summary_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(10))
+                .time_to_live(Duration::from_secs(60))
                 .build(),
             pwd_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(3600))
@@ -99,6 +108,12 @@ impl BinderCoreV2 {
                 .build(),
             bridge_per_key: Cache::builder()
                 .time_to_live(Duration::from_secs(30))
+                .build(),
+
+            bridge_secret_cache: Cache::new(100),
+
+            announcements_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(10))
                 .build(),
 
             premium_route_cache: Cache::builder()
@@ -272,7 +287,7 @@ impl BinderCoreV2 {
         // insert into the system
         let mut txn = self.postgres.begin().await?;
         // HACK: we encode the protocol into the allocation group name
-        sqlx::query("insert into routes (hostname, sosistab_pubkey, bridge_address, bridge_group, update_time) values ($1, $2, $3, $4, $5) on conflict (bridge_address) do
+        sqlx::query("insert into routes (hostname, sosistab_pubkey, bridge_address, bridge_group, update_time) values ($1, $2, $3, $4, $5) on conflict (bridge_address, bridge_group) do
         update set hostname = excluded.hostname, sosistab_pubkey = excluded.sosistab_pubkey, bridge_group = excluded.bridge_group, update_time = excluded.update_time")
         .bind(bridge.exit_hostname.as_str())
         .bind(bridge.sosistab_key.to_vec())
@@ -289,12 +304,23 @@ impl BinderCoreV2 {
         if let Some(summary) = self.summary_cache.get(&()) {
             Ok(summary)
         } else {
+            let bridge_secret = if let Some(bs) = self.bridge_secret_cache.get(&()) {
+                bs
+            } else {
+                let (bridge_secret,): (Vec<u8>,) =
+                    sqlx::query_as("select value from secrets where key = 'bridge_secret'")
+                        .fetch_one(&self.postgres)
+                        .await?;
+                self.bridge_secret_cache.insert((), bridge_secret.clone());
+                bridge_secret
+            };
             let qresult: Vec<(String, [u8; 32], String, String, [u8; 32], bool)> = sqlx::query_as(
                 "select hostname,signing_key,country,city,sosistab_key,plus from exits",
             )
             .fetch_all(&self.postgres)
             .await?;
-            let exits = qresult
+
+            let mut exits = qresult
                 .into_iter()
                 .map(|row| {
                     ExitDescriptor {
@@ -309,12 +335,45 @@ impl BinderCoreV2 {
                         } else {
                             vec![Level::Free, Level::Plus]
                         },
+                        load: 0.99,
                     }
                 })
                 .collect_vec();
-            // for exit in exits.iter_mut() {
-            //     exit.direct_routes = self.get_self_bridges(&exit.hostname).await?;
-            // }
+            {
+                let exec = smol::Executor::new();
+                let mut accum = vec![];
+                for exit in exits.iter_mut() {
+                    accum.push(exec.spawn(async {
+                        let exit_addr = smol::net::resolve(format!("{}:28080", exit.hostname))
+                            .await?
+                            .get(0)
+                            .copied()
+                            .context("no dns result for exit")?;
+                        let transport = BridgeExitTransport::new(
+                            *blake3::hash(&bridge_secret).as_bytes(),
+                            exit_addr,
+                        );
+                        let client = BridgeExitClient(transport);
+                        exit.load = client
+                            .load_factor()
+                            .timeout(Duration::from_millis(500))
+                            .await
+                            .context(format!(
+                                "timeout while asking for load from {}",
+                                exit.hostname
+                            ))??;
+                        anyhow::Ok(())
+                    }));
+                }
+                exec.run(async move {
+                    for a in accum {
+                        if let Err(err) = a.await {
+                            log::warn!("failed: {:?}", err)
+                        }
+                    }
+                })
+                .await
+            }
             let summ = MasterSummary {
                 exits,
                 bad_countries: vec!["cn".into(), "ir".into()],
@@ -331,6 +390,14 @@ impl BinderCoreV2 {
         exit: SmolStr,
         validate: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
+        self.statsd_client.incr(&format!(
+            "gb_versions.{}",
+            token
+                .version
+                .clone()
+                .unwrap_or_else(|| "old".into())
+                .replace(".", "-")
+        ));
         let opaque_id = blake3::hash(&bincode::serialize(&token).unwrap());
         if let Some(bridges) = self
             .bridge_per_key
@@ -408,6 +475,18 @@ impl BinderCoreV2 {
         let mut seen = HashSet::new();
         let mut gathered = vec![];
         for bridge in all_bridges {
+            // only show obfsudp bridges if the version number is new enough
+            if !token
+                .version
+                .as_ref()
+                .and_then(|v| Version::parse(v).ok())
+                .map(|v| v >= Version::parse("4.7.4").unwrap())
+                .unwrap_or(false)
+                && bridge.protocol.contains("obfsudp")
+                && !bridge.is_direct
+            {
+                continue;
+            }
             if (token.level == Level::Plus || !premium_routes.contains(bridge.alloc_group.as_str()))
                 && seen.insert((bridge.alloc_group.clone(), bridge.protocol.clone()))
             {
@@ -474,7 +553,7 @@ impl BinderCoreV2 {
             return Ok(Err(AuthError::TooManyRequests));
         }
 
-        if fastrand::f64() < 0.01 {
+        if fastrand::f64() < 0.001 {
             let (count,): (i64,) = sqlx::query_as(
                 "select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'",
             )
@@ -531,6 +610,24 @@ impl BinderCoreV2 {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    /// Gets announcements.
+    pub async fn get_announcements(&self) -> String {
+        if let Some(ann) = self.announcements_cache.get(&()) {
+            return ann;
+        }
+        loop {
+            let fallible = async {
+                let resp = reqwest::get("https://rsshub.app/telegram/channel/gephannounce").await?;
+                let bts = resp.bytes().await?;
+                anyhow::Ok(String::from_utf8_lossy(&bts).to_string())
+            };
+            if let Ok(val) = fallible.await {
+                self.announcements_cache.insert((), val.clone());
+                return val;
+            }
         }
     }
 

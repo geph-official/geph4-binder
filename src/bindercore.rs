@@ -568,17 +568,6 @@ impl BinderCore {
                 if res.is_empty() {
                     return Err(BinderError::Other("bridge refresh failed".into()));
                 }
-                let mut conn = self.get_pg_conn().map_err(to_dberr)?;
-                let mut txn = conn.transaction().map_err(to_dberr)?;
-                for bridge in res.iter() {
-                    let bridge_ip = bridge.endpoint.ip();
-                    txn.query(
-                "insert into bridge_assignments_new values ($1, $2, $3) on conflict do nothing",
-                &[&token_id, &bridge_ip.to_string(), &SystemTime::now()],
-            )
-            .map_err(to_dberr)?;
-                }
-                txn.commit().map_err(to_dberr)?;
 
                 Ok(res)
             })

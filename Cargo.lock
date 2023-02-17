@@ -277,6 +277,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-native-tls"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d57d4cec3c647232e1094dc013546c0b33ce785d8aeb251e1f20dfaf8a9a13fe"
+dependencies = [
+ "futures-util",
+ "native-tls",
+ "thiserror",
+ "url",
+]
+
+[[package]]
 name = "async-net"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -356,9 +368,9 @@ checksum = "2f23d769dbf1838d5df5156e7b1ad404f4c463d1ac2c6aeb6cd943630f8a8400"
 dependencies = [
  "futures-core",
  "futures-io",
- "rustls 0.19.1",
- "webpki 0.21.4",
- "webpki-roots 0.21.1",
+ "rustls",
+ "webpki",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -694,7 +706,7 @@ checksum = "4acbb09d9ee8e23699b9634375c72795d095bf268439da88562cf9b501f181fa"
 dependencies = [
  "camino",
  "cargo-platform",
- "semver 1.0.14",
+ "semver 1.0.16",
  "serde",
  "serde_json",
 ]
@@ -1635,17 +1647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "futures-rustls"
-version = "0.22.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2411eed028cdf8c8034eaf21f9915f956b6c3abec4d4c7949ee67f0721127bd"
-dependencies = [
- "futures-io",
- "rustls 0.20.7",
- "webpki 0.22.0",
-]
-
-[[package]]
 name = "futures-sink"
 version = "0.3.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1763,9 +1764,11 @@ dependencies = [
  "rsa",
  "rusty_pool",
  "scopeguard",
+ "semver 1.0.16",
  "serde",
  "serde_json",
  "smol",
+ "smol-timeout",
  "smol_str",
  "smolscale",
  "sqlx",
@@ -1799,21 +1802,21 @@ dependencies = [
  "rand 0.7.3",
  "rsa",
  "rsa-fdh",
- "rustls 0.19.1",
+ "rustls",
  "serde",
  "smol",
  "smol-timeout",
  "smolscale",
  "thiserror",
- "webpki-roots 0.21.1",
+ "webpki-roots",
  "x25519-dalek",
 ]
 
 [[package]]
 name = "geph4-protocol"
-version = "0.10.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea5be006d37bd3589245b38604421fd41c825a6a59695dd8cee9ec8c7b767640"
+checksum = "8bca02c49a84e3a9451a02ce17f3fb967a938ed50eee8760f592862b8676d7a6"
 dependencies = [
  "acidjson",
  "anyhow",
@@ -1833,7 +1836,6 @@ dependencies = [
  "futures-util",
  "geph4-aioutils",
  "hex",
- "http-types",
  "log",
  "mizaru",
  "nanorpc",
@@ -3514,7 +3516,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa0f585226d2e68097d4f95d113b15b83a82e819ab25717ec0590d9584ef366"
 dependencies = [
- "semver 1.0.14",
+ "semver 1.0.16",
 ]
 
 [[package]]
@@ -3538,20 +3540,8 @@ dependencies = [
  "base64",
  "log",
  "ring",
- "sct 0.6.1",
- "webpki 0.21.4",
-]
-
-[[package]]
-name = "rustls"
-version = "0.20.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "539a2bfe908f471bfa933876bd1eb6a19cf2176d375f82ef7f99530a40e48c2c"
-dependencies = [
- "log",
- "ring",
- "sct 0.7.0",
- "webpki 0.22.0",
+ "sct",
+ "webpki",
 ]
 
 [[package]]
@@ -3559,15 +3549,6 @@ name = "rustls-pemfile"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5eebeaeb360c87bfb72e84abdb3447159c0eaececf1bef2aecd65a8be949d1c9"
-dependencies = [
- "base64",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0864aeff53f8c05aa08d86e5ef839d3dfcf07aeba2db32f12db0ef716e87bd55"
 dependencies = [
  "base64",
 ]
@@ -3660,16 +3641,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sct"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d53dcdb7c9f8158937a7981b48accfd39a43af418591a5d008c7b22b5e1b7ca4"
-dependencies = [
- "ring",
- "untrusted",
-]
-
-[[package]]
 name = "secret_integers"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3709,9 +3680,9 @@ dependencies = [
 
 [[package]]
 name = "semver"
-version = "1.0.14"
+version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e25dfac463d778e353db5be2449d1cce89bd6fd23c9f1ea21310ce6e5a1b29c4"
+checksum = "58bc9567378fc7690d6b2addae4e60ac2eeea07becb2c64b9f218b53865cba2a"
 dependencies = [
  "serde",
 ]
@@ -4155,8 +4126,6 @@ dependencies = [
  "paste",
  "percent-encoding",
  "rand 0.8.5",
- "rustls 0.20.7",
- "rustls-pemfile 1.0.1",
  "serde",
  "serde_json",
  "sha1 0.10.5",
@@ -4167,7 +4136,6 @@ dependencies = [
  "stringprep",
  "thiserror",
  "url",
- "webpki-roots 0.22.5",
  "whoami",
 ]
 
@@ -4196,8 +4164,9 @@ version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24c5b2d25fa654cc5f841750b8e1cdedbe21189bf9a9382ee90bfa9dd3562396"
 dependencies = [
+ "async-native-tls",
  "async-std",
- "futures-rustls",
+ "native-tls",
 ]
 
 [[package]]
@@ -4846,10 +4815,10 @@ dependencies = [
  "log",
  "once_cell",
  "qstring",
- "rustls 0.19.1",
+ "rustls",
  "url",
- "webpki 0.21.4",
- "webpki-roots 0.21.1",
+ "webpki",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4958,7 +4927,7 @@ dependencies = [
  "multipart",
  "percent-encoding",
  "pin-project",
- "rustls-pemfile 0.2.1",
+ "rustls-pemfile",
  "scoped-tls",
  "serde",
  "serde_json",
@@ -5076,31 +5045,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "webpki"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f095d78192e208183081cc07bc5515ef55216397af48b873e5edcd72637fa1bd"
-dependencies = [
- "ring",
- "untrusted",
-]
-
-[[package]]
 name = "webpki-roots"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aabe153544e473b775453675851ecc86863d2a81d786d741f6b76778f2a48940"
 dependencies = [
- "webpki 0.21.4",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.22.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "368bfe657969fb01238bb756d351dcade285e0f6fcbd36dcb23359a5169975be"
-dependencies = [
- "webpki 0.22.0",
+ "webpki",
 ]
 
 [[package]]

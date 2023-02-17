@@ -16,6 +16,7 @@ use geph4_protocol::binder::protocol::{
 };
 use nanorpc::{JrpcRequest, RpcService};
 
+use rand::Rng;
 use smol_str::SmolStr;
 use std::{
     net::SocketAddr,
@@ -53,6 +54,14 @@ struct Opt {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Stress-tests load balancing as well as forcing upgrades.
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(
+            rand::thread_rng().gen_range(1800, 3600),
+        ));
+        std::process::exit(-1);
+    });
+
     smolscale::block_on(async {
         env_logger::Builder::from_env(Env::default().default_filter_or("geph4_binder=info")).init();
         let opt = Opt::from_args();
@@ -228,6 +237,10 @@ impl BinderProtocol for BinderCoreWrapper {
 
     async fn get_mizaru_epoch_key(&self, level: Level, epoch: u16) -> rsa::RSAPublicKey {
         self.core_v2.get_epoch_key(level, epoch as usize).await
+    }
+
+    async fn get_announcements(&self) -> String {
+        self.core_v2.get_announcements().await
     }
 }
 

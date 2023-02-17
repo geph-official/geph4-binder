@@ -50,7 +50,7 @@ tap = "1.0.1"
 jemallocator-global = "0.3.0"
 moka = "0.9.3"
 itertools = "0.10.3"
-geph4-protocol = "0.10"
+geph4-protocol = "0.14.0"
  
 async-trait = "0.1.57"
 async-oneshot = "0.5.0"
@@ -61,13 +61,15 @@ smolscale = "0.3.41"
 nanorpc = "0.1.7" 
 warp = "0.3.3"
 async-compat = "0.2.1"
-sqlx = { version = "0.6", features = [ "runtime-async-std-rustls", "postgres", "chrono" ] }
+sqlx = { version = "0.6", features = [ "runtime-async-std-native-tls", "postgres", "chrono" ] }
 futures-util = "0.3.25"
 dirs = "4.0.0"
 reqwest = "0.11.13"
 num_cpus = "1.14.0"
 imbl = "2.0.0"
 backoff = "0.4.0"
+smol-timeout = "0.6.0"
+semver = "1.0.16"
 
 [profile.release]
 panic = 'abort'
