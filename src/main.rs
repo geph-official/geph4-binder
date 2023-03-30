@@ -16,6 +16,7 @@ use geph4_protocol::binder::protocol::{
 };
 use nanorpc::{JrpcRequest, RpcService};
 
+use mimalloc::MiMalloc;
 use rand::Rng;
 use smol_str::SmolStr;
 use std::{
@@ -26,7 +27,11 @@ use std::{
 };
 use structopt::StructOpt;
 use warp::Filter;
-const POOL_SIZE: usize = 8;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+const POOL_SIZE: usize = 4;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
@@ -57,7 +62,7 @@ fn main() -> anyhow::Result<()> {
     // Stress-tests load balancing as well as forcing upgrades.
     std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_secs(
-            rand::thread_rng().gen_range(1800, 3600),
+            rand::thread_rng().gen_range(3600, 86400),
         ));
         std::process::exit(-1);
     });

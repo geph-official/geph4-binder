@@ -44,8 +44,9 @@ pub struct BinderCoreV2 {
 
     // caches the network summary
     summary_cache: Cache<(), MasterSummary>,
-    // caches the correct password of a user. prevents DoS attacks
-    pwd_cache: Cache<SmolStr, SmolStr>,
+    // caches the last load
+    load_cache: Arc<DashMap<SmolStr, f64>>,
+
     // caches the entire req/resp of authentications.
     auth_cache: Cache<AuthRequest, AuthResponse>,
     // caches the per-epoch key
@@ -63,11 +64,15 @@ pub struct BinderCoreV2 {
 
     announcements_cache: Cache<(), String>,
 
+    validate_cache: Cache<blake3::Hash, bool>,
+
     // Postgres
     postgres: PgPool,
 
     // stats client
     statsd_client: Arc<statsd::Client>,
+
+    _task: Task<()>,
 }
 
 impl BinderCoreV2 {
@@ -87,16 +92,25 @@ impl BinderCoreV2 {
                     .ssl_root_cert_from_pem(cert.to_vec()),
             )
             .await?;
+        let load_cache = Arc::new(DashMap::new());
+        let _task = {
+            let load_cache = load_cache.clone();
+            smolscale::spawn(async move {
+                loop {
+                    smol::Timer::after(Duration::from_secs(fastrand::u64(30..120))).await;
+                    //         let (count,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
+                    // .fetch_one(& postgres)
+                    // .await.unwrap();
+                    //         statsd_client.gauge("usercount", count as f64);
+                }
+            })
+        };
         Ok(Self {
             captcha_service_url: captcha_service_url.into(),
             mizaru_sk: Default::default(),
-
+            load_cache,
             summary_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(60))
-                .build(),
-            pwd_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(3600))
-                .max_capacity(100000)
+                .time_to_live(Duration::from_secs(600))
                 .build(),
             auth_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(3600))
@@ -122,6 +136,10 @@ impl BinderCoreV2 {
 
             postgres,
             statsd_client,
+
+            validate_cache: Cache::new(100000),
+
+            _task,
         })
     }
 
@@ -272,7 +290,7 @@ impl BinderCoreV2 {
         let signed_msg =
             bincode::serialize(&bridge.clone().tap_mut(|d| d.exit_signature = Bytes::new()))
                 .unwrap();
-        log::debug!("to verify: {}", hex::encode(&signed_msg));
+        // log::debug!("to verify: {}", hex::encode(&signed_msg));
         signing_exit
             .signing_key
             .verify_strict(
@@ -335,7 +353,7 @@ impl BinderCoreV2 {
                         } else {
                             vec![Level::Free, Level::Plus]
                         },
-                        load: 0.99,
+                        load: 9.99,
                     }
                 })
                 .collect_vec();
@@ -553,14 +571,6 @@ impl BinderCoreV2 {
             return Ok(Err(AuthError::TooManyRequests));
         }
 
-        if fastrand::f64() < 0.001 {
-            let (count,): (i64,) = sqlx::query_as(
-                "select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'",
-            )
-            .fetch_one(&mut txn)
-            .await?;
-            self.statsd_client.gauge("usercount", count as f64);
-        }
         txn.commit().await?;
 
         let sig = key.blind_sign(auth_req.epoch as usize, &auth_req.blinded_digest);
@@ -574,26 +584,24 @@ impl BinderCoreV2 {
 
     /// Validates a token
     pub async fn validate(&self, token: BlindToken) -> bool {
+        let cache_key = blake3::hash(&bincode::serialize(&token).unwrap());
+        if let Some(val) = self.validate_cache.get(&cache_key) {
+            return val;
+        }
         let key = self.get_mizaru_sk(token.level).await.to_public_key();
-        key.blind_verify(
+        let value = key.blind_verify(
             &token.unblinded_digest,
             &match bincode::deserialize(&token.unblinded_signature_bincode) {
                 Ok(v) => v,
                 _ => return false,
             },
-        )
+        );
+        self.validate_cache.insert(cache_key, value);
+        value
     }
 
     /// Verifies the password.
     async fn verify_password(&self, username: &str, password: &str) -> anyhow::Result<bool> {
-        if self
-            .pwd_cache
-            .get(username)
-            .map(|known| known == password)
-            .unwrap_or_default()
-        {
-            return Ok(true);
-        }
         let mut txn = self.postgres.begin().await?;
         let (pwdhash,): (String,) = if let Some(v) =
             sqlx::query_as("select pwdhash from users where username = $1")
@@ -606,7 +614,6 @@ impl BinderCoreV2 {
             return Ok(false);
         };
         if verify_libsodium_password(password.to_string(), pwdhash).await {
-            self.pwd_cache.insert(username.into(), password.into());
             Ok(true)
         } else {
             Ok(false)

@@ -70,6 +70,7 @@ imbl = "2.0.0"
 backoff = "0.4.0"
 smol-timeout = "0.6.0"
 semver = "1.0.16"
+mimalloc = "0.1.34"
 
 [profile.release]
 panic = 'abort'
