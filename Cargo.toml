@@ -50,7 +50,7 @@ tap = "1.0.1"
 jemallocator-global = "0.3.0"
 moka = "0.9.3"
 itertools = "0.10.3"
-geph4-protocol = "0.14.0"
+geph4-protocol = {path="../geph4-protocol"}
  
 async-trait = "0.1.57"
 async-oneshot = "0.5.0"
@@ -71,6 +71,10 @@ backoff = "0.4.0"
 smol-timeout = "0.6.0"
 semver = "1.0.16"
 mimalloc = "0.1.34"
+melprot = "0.13.4"
+melstructs = "0.3.2"
+melnet2 = "0.3.1"
+melbootstrap = "0.8.3"
 
 [profile.release]
 panic = 'abort'

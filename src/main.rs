@@ -1,6 +1,7 @@
 mod bindercore;
 mod bindercore_v2;
 mod responder;
+use anyhow::Context;
 use async_compat::CompatExt;
 use async_trait::async_trait;
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
@@ -13,10 +14,13 @@ use futures_lite::Future;
 use geph4_protocol::binder::protocol::{
     box_decrypt, box_encrypt, AuthError, AuthRequest, AuthResponse, BinderProtocol, BinderService,
     BlindToken, BridgeDescriptor, Captcha, Level, MasterSummary, MiscFatalError, RegisterError,
+    RpcError,
 };
-use nanorpc::{JrpcRequest, RpcService};
+use melnet2::{wire::http::HttpBackhaul, Backhaul};
+use nanorpc::{DynRpcTransport, JrpcRequest, JrpcResponse, RpcService, RpcTransport};
 
 use mimalloc::MiMalloc;
+use once_cell::sync::Lazy;
 use rand::Rng;
 use smol_str::SmolStr;
 use std::{
@@ -246,6 +250,30 @@ impl BinderProtocol for BinderCoreWrapper {
 
     async fn get_announcements(&self) -> String {
         self.core_v2.get_announcements().await
+    }
+
+    /// Reverse proxies requests to melnode
+    async fn reverse_proxy_melnode(&self, req: JrpcRequest) -> Result<JrpcResponse, RpcError> {
+        // find a melnode and connect to it
+        let bootstrap_routes = melbootstrap::bootstrap_routes(melstructs::NetID::Mainnet);
+        let route = *bootstrap_routes
+            .first()
+            .context("Error retreiving bootstrap routes")
+            .map_err(|_| RpcError::BootstrapFailed)?;
+        static BACKHAUL: Lazy<HttpBackhaul> = Lazy::new(HttpBackhaul::new);
+        let rpc_transport = DynRpcTransport::new(
+            BACKHAUL
+                .connect(route.to_string().into())
+                .await
+                .map_err(|_| RpcError::ConnectFailed)?,
+        );
+
+        // send!
+        let resp = rpc_transport
+            .call_raw(req)
+            .await
+            .map_err(|_| RpcError::CommFailed)?;
+        Ok(resp)
     }
 }
 
