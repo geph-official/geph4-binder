@@ -33,7 +33,7 @@ use smol_timeout::TimeoutExt;
 use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
-    PgPool,
+    FromRow, PgPool,
 };
 use tap::Tap;
 
@@ -45,8 +45,6 @@ pub struct BinderCoreV2 {
 
     // caches the network summary
     summary_cache: Cache<(), MasterSummary>,
-    // caches the last load
-    load_cache: Arc<DashMap<SmolStr, f64>>,
 
     // caches the entire req/resp of authentications.
     auth_cache: Cache<AuthRequest, AuthResponse>,
@@ -93,23 +91,24 @@ impl BinderCoreV2 {
                     .ssl_root_cert_from_pem(cert.to_vec()),
             )
             .await?;
-        let load_cache = Arc::new(DashMap::new());
+
         let _task = {
-            let load_cache = load_cache.clone();
+            let postgres = postgres.clone();
+            let statsd_client = statsd_client.clone();
             smolscale::spawn(async move {
                 loop {
-                    smol::Timer::after(Duration::from_secs(fastrand::u64(30..120))).await;
-                    //         let (count,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
-                    // .fetch_one(& postgres)
-                    // .await.unwrap();
-                    //         statsd_client.gauge("usercount", count as f64);
+                    smol::Timer::after(Duration::from_secs(fastrand::u64(300..1200))).await;
+                    let (count,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
+                    .fetch_one(& postgres)
+                    .await.unwrap();
+                    statsd_client.gauge("usercount", count as f64);
                 }
             })
         };
         Ok(Self {
             captcha_service_url: captcha_service_url.into(),
             mizaru_sk: Default::default(),
-            load_cache,
+
             summary_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(600))
                 .build(),
@@ -320,6 +319,16 @@ impl BinderCoreV2 {
 
     /// Obtains the summary of the whole state.
     pub async fn get_summary(&self) -> anyhow::Result<MasterSummary> {
+        #[derive(Debug, FromRow)]
+        struct ExitRecord {
+            hostname: String,
+            signing_key: [u8; 32],
+            country: String,
+            city: String,
+            sosistab_key: [u8; 32],
+            plus: bool,
+        }
+
         if let Some(summary) = self.summary_cache.get(&()) {
             Ok(summary)
         } else {
@@ -333,7 +342,7 @@ impl BinderCoreV2 {
                 self.bridge_secret_cache.insert((), bridge_secret.clone());
                 bridge_secret
             };
-            let qresult: Vec<(String, [u8; 32], String, String, [u8; 32], bool)> = sqlx::query_as(
+            let qresult: Vec<ExitRecord> = sqlx::query_as(
                 "select hostname,signing_key,country,city,sosistab_key,plus from exits",
             )
             .fetch_all(&self.postgres)
@@ -341,15 +350,16 @@ impl BinderCoreV2 {
 
             let mut exits = qresult
                 .into_iter()
-                .map(|row| {
+                .map(|exit| {
                     ExitDescriptor {
-                        hostname: row.0.into(),
-                        signing_key: ed25519_dalek::PublicKey::from_bytes(&row.1).unwrap(),
-                        country_code: row.2.into(),
-                        city_code: row.3.into(),
+                        hostname: exit.hostname.into(),
+                        signing_key: ed25519_dalek::PublicKey::from_bytes(&exit.signing_key)
+                            .unwrap(),
+                        country_code: exit.country.into(),
+                        city_code: exit.city.into(),
                         direct_routes: vec![], // fill in in the future
-                        legacy_direct_sosistab_pk: x25519_dalek::PublicKey::from(row.4),
-                        allowed_levels: if row.5 {
+                        legacy_direct_sosistab_pk: x25519_dalek::PublicKey::from(exit.sosistab_key),
+                        allowed_levels: if exit.plus {
                             vec![Level::Plus]
                         } else {
                             vec![Level::Free, Level::Plus]
@@ -415,7 +425,7 @@ impl BinderCoreV2 {
                 .version
                 .clone()
                 .unwrap_or_else(|| "old".into())
-                .replace(".", "-")
+                .replace('.', "-")
         ));
         let opaque_id = blake3::hash(&bincode::serialize(&token).unwrap());
         if let Some(bridges) = self

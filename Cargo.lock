@@ -2026,6 +2026,7 @@ dependencies = [
  "gibbername",
  "hex",
  "log",
+ "melbootstrap",
  "melprot",
  "melstructs",
  "mizaru",
