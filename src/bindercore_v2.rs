@@ -15,8 +15,8 @@ use futures_util::{future::Shared, FutureExt};
 
 use geph4_protocol::{
     binder::protocol::{
-        AuthError, AuthRequest, AuthResponse, BlindToken, BridgeDescriptor, Captcha,
-        ExitDescriptor, Level, MasterSummary, RegisterError, SubscriptionInfo, UserInfo,
+        AuthError, AuthRequest, AuthRequestV2, AuthResponse, BlindToken, BridgeDescriptor, Captcha,
+        ExitDescriptor, Level, MasterSummary, RegisterError, SubscriptionInfo, UserInfo, AuthKind, UserInfoV2, AuthResponseV2,
     },
     bridge_exit::{BridgeExitClient, BridgeExitTransport},
 };
@@ -48,6 +48,10 @@ pub struct BinderCoreV2 {
 
     // caches the entire req/resp of authentications.
     auth_cache: Cache<AuthRequest, AuthResponse>,
+
+    // caches the entire req/resp of authentications for V2
+    auth_cache_v2: Cache<AuthRequestV2, AuthResponseV2>,
+
     // caches the per-epoch key
     epoch_key_cache: Cache<(Level, usize), rsa::RSAPublicKey>,
 
@@ -113,6 +117,10 @@ impl BinderCoreV2 {
                 .time_to_live(Duration::from_secs(600))
                 .build(),
             auth_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(3600))
+                .max_capacity(100000)
+                .build(),
+            auth_cache_v2: Cache::builder()
                 .time_to_live(Duration::from_secs(3600))
                 .max_capacity(100000)
                 .build(),
@@ -593,6 +601,61 @@ impl BinderCoreV2 {
         Ok(Ok(response))
     }
 
+    pub async fn authenticate_v2(&self, auth_req: &AuthRequestV2) -> anyhow::Result<Result<AuthResponseV2, AuthError>> {
+        if let Some(val) = self.auth_cache_v2.get(auth_req) {
+            return Ok(Ok(val));
+        }
+
+        let user_info = if let Some(user_info) = self.get_user_info_v2(auth_req.auth_kind.clone()).await? {
+            user_info
+        } else {
+            return Ok(Err(AuthError::InvalidUsernameOrPassword));
+        };
+
+        // Authenticate
+        if !self
+            .verify(auth_req.auth_kind.clone())
+            .await?
+        {
+            return Ok(Err(AuthError::InvalidUsernameOrPassword));
+        }
+
+        let key = self.get_mizaru_sk(auth_req.level).await;
+        let real_epoch = mizaru::time_to_epoch(SystemTime::now());
+        if real_epoch.abs_diff(auth_req.epoch as usize) > 1 {
+            return Ok(Err(AuthError::Other("time way too out of sync".into())));
+        }
+
+        // TODO rate limiting
+
+        let mut txn = self.postgres.begin().await?;
+        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
+            .bind(user_info.userid)
+            .bind(Utc::now().naive_utc())
+            .execute(&mut txn)
+            .await?;
+
+        let (login_count,): (i64,) = sqlx::query_as(
+                "select count (*) from (select distinct last_login from auth_logs where id = $1 and last_login + '1 day' > NOW()) as temp",
+            )
+            .bind(user_info.userid)
+            .fetch_one(&mut txn)
+            .await?;
+        if login_count > 30 {
+            return Ok(Err(AuthError::TooManyRequests));
+        }
+
+        txn.commit().await?;
+
+        let sig = key.blind_sign(auth_req.epoch as usize, &auth_req.blinded_digest);
+        let response = AuthResponseV2 {
+            user_info,
+            blind_signature_bincode: bincode::serialize(&sig).unwrap().into(),
+        };
+        self.auth_cache_v2.insert(auth_req.clone(), response.clone());
+        Ok(Ok(response))
+    }
+
     /// Validates a token
     pub async fn validate(&self, token: BlindToken) -> bool {
         let cache_key = blake3::hash(&bincode::serialize(&token).unwrap());
@@ -609,6 +672,14 @@ impl BinderCoreV2 {
         );
         self.validate_cache.insert(cache_key, value);
         value
+    }
+
+    /// Verifies given credentials
+    async fn verify(&self, auth_kind: AuthKind) -> anyhow::Result<bool> {
+        match auth_kind {
+            AuthKind::Password(user, pass) => self.verify_password(user.as_str(), pass.as_str()).await,
+            AuthKind::Signature => todo!(),
+        }
     }
 
     /// Verifies the password.
@@ -673,6 +744,42 @@ impl BinderCoreV2 {
             userid,
             username: username.into(),
 
+            subscription: plan_row.map(|row| SubscriptionInfo {
+                level: Level::Plus,
+                expires_unix: row.1 as i64,
+            }),
+        }))
+    }
+
+    async fn get_user_info_v2(&self, auth: AuthKind) -> Result<Option<UserInfoV2>, sqlx::Error> {
+        let mut txn = self.postgres.begin().await?;
+        let res: Option<(i32,)> = match auth {
+            AuthKind::Password(user, pass) => {
+                sqlx::query_as("select id from auth_password where username = $1")
+                    .bind(user.as_str())
+                    .fetch_optional(&mut txn)
+                    .await?
+            },
+            AuthKind::Signature => {
+                todo!()
+            },
+        };
+
+        let (userid,) = if let Some(res) = res {
+            res
+        } else {
+            return Ok(None);
+        };
+
+        let plan_row: Option<(String, f64)> = sqlx::query_as(
+            "select plan, extract(epoch from expires) from subscriptions where id = $1",
+        )
+            .bind(userid)
+            .fetch_optional(&mut txn)
+            .await?;
+
+        Ok(Some(UserInfoV2 {
+            userid,
             subscription: plan_row.map(|row| SubscriptionInfo {
                 level: Level::Plus,
                 expires_unix: row.1 as i64,

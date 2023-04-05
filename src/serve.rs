@@ -13,7 +13,7 @@ use futures_lite::Future;
 use geph4_protocol::binder::protocol::{
     box_decrypt, box_encrypt, AuthError, AuthRequest, AuthResponse, BinderProtocol, BinderService,
     BlindToken, BridgeDescriptor, Captcha, Level, MasterSummary, MiscFatalError, RegisterError,
-    RpcError,
+    RpcError, AuthRequestV2, AuthResponseV2,
 };
 use melnet2::{wire::http::HttpBackhaul, Backhaul};
 use nanorpc::{DynRpcTransport, JrpcRequest, JrpcResponse, RpcService, RpcTransport};
@@ -84,6 +84,10 @@ struct BinderCoreWrapper {
 impl BinderProtocol for BinderCoreWrapper {
     async fn authenticate(&self, auth_req: AuthRequest) -> Result<AuthResponse, AuthError> {
         backoff(|| self.core_v2.authenticate(&auth_req)).await
+    }
+
+    async fn authenticate_v2(&self, auth_req: AuthRequestV2) -> Result<AuthResponseV2, AuthError> {
+        backoff(|| self.core_v2.authenticate_v2(&auth_req)).await
     }
 
     async fn validate(&self, token: BlindToken) -> bool {
