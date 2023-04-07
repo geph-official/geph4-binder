@@ -691,7 +691,7 @@ impl BinderCoreV2 {
     async fn verify_password(&self, username: &str, password: &str) -> anyhow::Result<bool> {
         let mut txn = self.postgres.begin().await?;
         let (pwdhash,): (String,) = if let Some(v) =
-            sqlx::query_as("select pwdhash from users where username = $1")
+            sqlx::query_as("select pwdhash from auth_password where username = $1")
                 .bind(username)
                 .fetch_optional(&mut txn)
                 .await?
@@ -759,9 +759,9 @@ impl BinderCoreV2 {
     async fn get_user_info_v2(&self, auth: AuthKind) -> Result<Option<UserInfoV2>, sqlx::Error> {
         let mut txn = self.postgres.begin().await?;
         let res: Option<(i32,)> = match auth {
-            AuthKind::Password(user, pass) => {
+            AuthKind::Password(username, _password) => {
                 sqlx::query_as("select user_id from auth_password where username = $1")
-                    .bind(user.as_str())
+                    .bind(username.as_str())
                     .fetch_optional(&mut txn)
                     .await?
             }
