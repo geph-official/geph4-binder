@@ -37,11 +37,15 @@ use sqlx::{
     FromRow, PgPool,
 };
 use tap::Tap;
+use tmelcrypt::Ed25519PK;
 
 use crate::POOL_SIZE;
 
+const SIG_WINDOW_SEC: u64 = 3600;
+
 pub struct BinderCoreV2 {
     captcha_service_url: SmolStr,
+
     mizaru_sk: DashMap<Level, Shared<Task<mizaru::SecretKey>>>,
 
     // caches the network summary
@@ -58,6 +62,7 @@ pub struct BinderCoreV2 {
 
     // caches bridges *per exit*
     bridge_per_exit_cache: Cache<SmolStr, Vec<BridgeDescriptor>>,
+
     // caches bridges *per key*
     bridge_per_key: Cache<blake3::Hash, Vec<BridgeDescriptor>>,
 
@@ -684,7 +689,11 @@ impl BinderCoreV2 {
                 self.verify_password(username.as_str(), password.as_str())
                     .await
             }
-            _ => todo!(),
+            Credentials::Signature {
+                pubkey,
+                signature,
+                message,
+            } => self.verify_signature(pubkey, signature, &message).await,
         }
     }
 
@@ -705,6 +714,32 @@ impl BinderCoreV2 {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    /// Verifies the signature
+    async fn verify_signature(
+        &self,
+        pubkey: Ed25519PK,
+        signature: Vec<u8>,
+        message: &str,
+    ) -> anyhow::Result<bool> {
+        let sig_time = str::replace(message, "geph-auth-", "");
+        let sig_time: u64 = sig_time.parse()?;
+        let diff = SystemTime::now().checked_sub(Duration::new(sig_time, 0));
+
+        match diff {
+            Some(diff) => {
+                if diff.elapsed()?.as_secs() > SIG_WINDOW_SEC {
+                    Ok(false)
+                } else {
+                    Ok(pubkey.verify(message.as_bytes(), &signature))
+                }
+            }
+            None => {
+                log::error!("Invalid timestamp message: {}", message);
+                Ok(false)
+            }
         }
     }
 
