@@ -15,8 +15,9 @@ use futures_util::{future::Shared, FutureExt};
 
 use geph4_protocol::{
     binder::protocol::{
-        AuthError, AuthRequest, AuthRequestV2, AuthResponse, BlindToken, BridgeDescriptor, Captcha,
-        ExitDescriptor, Level, MasterSummary, RegisterError, SubscriptionInfo, UserInfo, AuthKind, UserInfoV2, AuthResponseV2,
+        AuthError, AuthKind, AuthRequest, AuthRequestV2, AuthResponse, AuthResponseV2, BlindToken,
+        BridgeDescriptor, Captcha, ExitDescriptor, Level, MasterSummary, RegisterError,
+        SubscriptionInfo, UserInfo, UserInfoV2,
     },
     bridge_exit::{BridgeExitClient, BridgeExitTransport},
 };
@@ -601,22 +602,23 @@ impl BinderCoreV2 {
         Ok(Ok(response))
     }
 
-    pub async fn authenticate_v2(&self, auth_req: &AuthRequestV2) -> anyhow::Result<Result<AuthResponseV2, AuthError>> {
+    pub async fn authenticate_v2(
+        &self,
+        auth_req: &AuthRequestV2,
+    ) -> anyhow::Result<Result<AuthResponseV2, AuthError>> {
         if let Some(val) = self.auth_cache_v2.get(auth_req) {
             return Ok(Ok(val));
         }
 
-        let user_info = if let Some(user_info) = self.get_user_info_v2(auth_req.auth_kind.clone()).await? {
-            user_info
-        } else {
-            return Ok(Err(AuthError::InvalidUsernameOrPassword));
-        };
+        let user_info =
+            if let Some(user_info) = self.get_user_info_v2(auth_req.auth_kind.clone()).await? {
+                user_info
+            } else {
+                return Ok(Err(AuthError::InvalidUsernameOrPassword));
+            };
 
         // Authenticate
-        if !self
-            .verify(auth_req.auth_kind.clone())
-            .await?
-        {
+        if !self.verify(auth_req.auth_kind.clone()).await? {
             return Ok(Err(AuthError::InvalidUsernameOrPassword));
         }
 
@@ -652,7 +654,8 @@ impl BinderCoreV2 {
             user_info,
             blind_signature_bincode: bincode::serialize(&sig).unwrap().into(),
         };
-        self.auth_cache_v2.insert(auth_req.clone(), response.clone());
+        self.auth_cache_v2
+            .insert(auth_req.clone(), response.clone());
         Ok(Ok(response))
     }
 
@@ -677,7 +680,9 @@ impl BinderCoreV2 {
     /// Verifies given credentials
     async fn verify(&self, auth_kind: AuthKind) -> anyhow::Result<bool> {
         match auth_kind {
-            AuthKind::Password(user, pass) => self.verify_password(user.as_str(), pass.as_str()).await,
+            AuthKind::Password(user, pass) => {
+                self.verify_password(user.as_str(), pass.as_str()).await
+            }
             AuthKind::Signature => todo!(),
         }
     }
@@ -755,14 +760,14 @@ impl BinderCoreV2 {
         let mut txn = self.postgres.begin().await?;
         let res: Option<(i32,)> = match auth {
             AuthKind::Password(user, pass) => {
-                sqlx::query_as("select id from auth_password where username = $1")
+                sqlx::query_as("select user_id from auth_password where username = $1")
                     .bind(user.as_str())
                     .fetch_optional(&mut txn)
                     .await?
-            },
+            }
             AuthKind::Signature => {
                 todo!()
-            },
+            }
         };
 
         let (userid,) = if let Some(res) = res {
@@ -774,9 +779,9 @@ impl BinderCoreV2 {
         let plan_row: Option<(String, f64)> = sqlx::query_as(
             "select plan, extract(epoch from expires) from subscriptions where id = $1",
         )
-            .bind(userid)
-            .fetch_optional(&mut txn)
-            .await?;
+        .bind(userid)
+        .fetch_optional(&mut txn)
+        .await?;
 
         Ok(Some(UserInfoV2 {
             userid,
