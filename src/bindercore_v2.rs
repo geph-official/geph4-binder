@@ -15,9 +15,9 @@ use futures_util::{future::Shared, FutureExt};
 
 use geph4_protocol::{
     binder::protocol::{
-        AuthError, AuthKind, AuthRequest, AuthRequestV2, AuthResponse, AuthResponseV2, BlindToken,
-        BridgeDescriptor, Captcha, ExitDescriptor, Level, MasterSummary, RegisterError,
-        SubscriptionInfo, UserInfo, UserInfoV2,
+        AuthError, AuthRequest, AuthRequestV2, AuthResponse, AuthResponseV2, BlindToken,
+        BridgeDescriptor, Captcha, Credentials, ExitDescriptor, Level, MasterSummary,
+        RegisterError, SubscriptionInfo, UserInfo, UserInfoV2,
     },
     bridge_exit::{BridgeExitClient, BridgeExitTransport},
 };
@@ -611,14 +611,14 @@ impl BinderCoreV2 {
         }
 
         let user_info =
-            if let Some(user_info) = self.get_user_info_v2(auth_req.auth_kind.clone()).await? {
+            if let Some(user_info) = self.get_user_info_v2(auth_req.credentials.clone()).await? {
                 user_info
             } else {
                 return Ok(Err(AuthError::InvalidUsernameOrPassword));
             };
 
         // Authenticate
-        if !self.verify(auth_req.auth_kind.clone()).await? {
+        if !self.verify(auth_req.credentials.clone()).await? {
             return Ok(Err(AuthError::InvalidUsernameOrPassword));
         }
 
@@ -678,12 +678,13 @@ impl BinderCoreV2 {
     }
 
     /// Verifies given credentials
-    async fn verify(&self, auth_kind: AuthKind) -> anyhow::Result<bool> {
-        match auth_kind {
-            AuthKind::Password(user, pass) => {
-                self.verify_password(user.as_str(), pass.as_str()).await
+    async fn verify(&self, credentials: Credentials) -> anyhow::Result<bool> {
+        match credentials {
+            Credentials::Password { username, password } => {
+                self.verify_password(username.as_str(), password.as_str())
+                    .await
             }
-            AuthKind::Signature => todo!(),
+            _ => todo!(),
         }
     }
 
@@ -756,18 +757,19 @@ impl BinderCoreV2 {
         }))
     }
 
-    async fn get_user_info_v2(&self, auth: AuthKind) -> Result<Option<UserInfoV2>, sqlx::Error> {
+    async fn get_user_info_v2(
+        &self,
+        credentials: Credentials,
+    ) -> Result<Option<UserInfoV2>, sqlx::Error> {
         let mut txn = self.postgres.begin().await?;
-        let res: Option<(i32,)> = match auth {
-            AuthKind::Password(username, _password) => {
+        let res: Option<(i32,)> = match credentials {
+            Credentials::Password { username, password } => {
                 sqlx::query_as("select user_id from auth_password where username = $1")
                     .bind(username.as_str())
                     .fetch_optional(&mut txn)
                     .await?
             }
-            AuthKind::Signature => {
-                todo!()
-            }
+            _ => todo!(),
         };
 
         let (userid,) = if let Some(res) = res {
