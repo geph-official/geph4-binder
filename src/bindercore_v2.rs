@@ -726,20 +726,13 @@ impl BinderCoreV2 {
     ) -> anyhow::Result<bool> {
         let sig_time = str::replace(message, "geph-auth-", "");
         let sig_time: u64 = sig_time.parse()?;
-        let diff = SystemTime::now().checked_sub(Duration::new(sig_time, 0));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let diff = now - sig_time;
 
-        match diff {
-            Some(diff) => {
-                if diff.elapsed()?.as_secs() > SIG_WINDOW_SEC {
-                    Ok(false)
-                } else {
-                    Ok(pubkey.verify(message.as_bytes(), &signature))
-                }
-            }
-            None => {
-                log::error!("Invalid timestamp message: {}", message);
-                Ok(false)
-            }
+        if diff > SIG_WINDOW_SEC {
+            Ok(false)
+        } else {
+            Ok(pubkey.verify(message.as_bytes(), &signature))
         }
     }
 
