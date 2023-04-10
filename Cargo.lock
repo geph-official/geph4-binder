@@ -2002,7 +2002,7 @@ dependencies = [
 [[package]]
 name = "geph4-protocol"
 version = "0.14.2"
-source = "git+https://github.com/geph-official/geph4-protocol?branch=gibbername-exits#ad71d808b7ecdfd6d43a1990a7dedc351168b883"
+source = "git+https://github.com/geph-official/geph4-protocol?branch=gibbername-exits#a3613214b9335009e71dbe7f78965be9e4563a6c"
 dependencies = [
  "acidjson",
  "anyhow",

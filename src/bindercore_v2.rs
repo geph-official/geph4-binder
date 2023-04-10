@@ -17,7 +17,7 @@ use geph4_protocol::{
     binder::protocol::{
         AuthError, AuthRequest, AuthRequestV2, AuthResponse, AuthResponseV2, BlindToken,
         BridgeDescriptor, Captcha, Credentials, ExitDescriptor, Level, MasterSummary,
-        RegisterError, SubscriptionInfo, UserInfo, UserInfoV2,
+        RegisterError, SubscriptionInfo, UserInfo, UserInfoV2, AUTH_MSG_PREFIX,
     },
     bridge_exit::{BridgeExitClient, BridgeExitTransport},
 };
@@ -827,10 +827,11 @@ impl BinderCoreV2 {
         signature: Vec<u8>,
         message: &str,
     ) -> anyhow::Result<bool> {
-        let sig_time = str::replace(message, "geph-auth-", "");
+        let sig_time = str::replace(message, AUTH_MSG_PREFIX, "");
         let sig_time: u64 = sig_time.parse()?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let diff = now - sig_time;
+
 
         if diff > SIG_WINDOW_SEC {
             Ok(false)
