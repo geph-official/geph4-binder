@@ -34,7 +34,7 @@ use smol_timeout::TimeoutExt;
 use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
-    FromRow, PgPool,
+    FromRow, PgPool, Row,
 };
 use tap::Tap;
 use tmelcrypt::Ed25519PK;
@@ -280,20 +280,23 @@ impl BinderCoreV2 {
         if self.get_user_info_v2(credentials.clone()).await?.is_some() {
             return Ok(Err(RegisterError::DuplicateCredentials));
         }
+
         let mut txn = self.postgres.begin().await?;
+        let row = sqlx::query(
+            "insert into users (freebalance, createtime) values ($1, $2) on conflict do nothing returning id"
+        )
+            .bind(1000i32)
+            .bind(Utc::now().naive_utc())
+            .fetch_one(&mut txn)
+            .await?;
+        let user_id: i32 = row.get(0);
 
         match credentials {
             Credentials::Password { username, password } => {
                 sqlx::query(
-                    "insert into users (freebalance, createtime) values ($1, $2) on conflict do nothing"
+                    "insert into auth_password (user_id, username, pwdhash) values ($1, $2, $3) on conflict do nothing"
                 )
-                    .bind(1000i32)
-                    .bind(Utc::now().naive_utc())
-                    .execute(&mut txn)
-                    .await?;
-                sqlx::query(
-                    "insert into auth_password (username, pwdhash) values ($1, $2) on conflict do nothing",
-                )
+                    .bind(user_id)
                     .bind(username.as_str())
                     .bind(hash_libsodium_password(password.as_str()).await)
                     .execute(&mut txn)
@@ -304,7 +307,8 @@ impl BinderCoreV2 {
                 signature,
                 message,
             } => {
-                sqlx::query("insert into auth_pubkey (pubkey) values ($1) on conflict do nothing")
+                sqlx::query("insert into auth_pubkey (user_id, pubkey) values ($1, $2) on conflict do nothing")
+                    .bind(user_id)
                     .bind(pubkey.0)
                     .execute(&mut txn)
                     .await?;
@@ -355,7 +359,7 @@ impl BinderCoreV2 {
         let userid = self
             .get_user_info_v2(credentials.clone())
             .await?
-            .expect("User not found")
+            .ok_or(AuthError::InvalidCredentials)?
             .userid;
         let mut txn = self.postgres.begin().await?;
 
@@ -365,8 +369,8 @@ impl BinderCoreV2 {
                     .bind(userid)
                     .execute(&mut txn)
                     .await?;
-                sqlx::query("delete from auth_password where username = $1")
-                    .bind(username.as_str())
+                sqlx::query("delete from auth_password where userid = $1")
+                    .bind(userid)
                     .execute(&mut txn)
                     .await?;
             }
@@ -379,8 +383,8 @@ impl BinderCoreV2 {
                     .bind(userid)
                     .execute(&mut txn)
                     .await?;
-                sqlx::query("delete from auth_pubkey where username = $1")
-                    .bind(pubkey.0)
+                sqlx::query("delete from auth_pubkey where userid = $1")
+                    .bind(userid)
                     .execute(&mut txn)
                     .await?;
             }
