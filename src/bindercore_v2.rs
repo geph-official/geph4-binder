@@ -247,7 +247,7 @@ impl BinderCoreV2 {
         }
         // TODO atomicity
         if self.get_user_info(username).await?.is_some() {
-            return Ok(Err(RegisterError::DuplicateUsername));
+            return Ok(Err(RegisterError::DuplicateCredentials));
         }
         let mut txn = self.postgres.begin().await?;
         sqlx::query(
@@ -259,6 +259,58 @@ impl BinderCoreV2 {
         .bind(Utc::now().naive_utc())
         .execute(&mut txn)
         .await?;
+        txn.commit().await?;
+        Ok(Ok(()))
+    }
+
+    /// Creates a new user, consuming a captcha answer.
+    pub async fn create_user_v2(
+        &self,
+        credentials: Credentials,
+        captcha_id: &str,
+        captcha_soln: &str,
+    ) -> anyhow::Result<Result<(), RegisterError>> {
+        // // EMERGENCY
+        // return Ok(Err(RegisterError::Other("too many requests".into())));
+        if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
+            log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
+            return Ok(Err(RegisterError::Other("incorrect captcha".into())));
+        }
+        // TODO atomicity
+        if self.get_user_info_v2(credentials.clone()).await?.is_some() {
+            return Ok(Err(RegisterError::DuplicateCredentials));
+        }
+        let mut txn = self.postgres.begin().await?;
+
+        match credentials {
+            Credentials::Password { username, password } => {
+                sqlx::query(
+                    "insert into users (freebalance, createtime) values ($1, $2) on conflict do nothing"
+                )
+                    .bind(1000i32)
+                    .bind(Utc::now().naive_utc())
+                    .execute(&mut txn)
+                    .await?;
+                sqlx::query(
+                    "insert into auth_password (username, pwdhash) values ($1, $2) on conflict do nothing",
+                )
+                    .bind(username.as_str())
+                    .bind(hash_libsodium_password(password.as_str()).await)
+                    .execute(&mut txn)
+                    .await?;
+            }
+            Credentials::Signature {
+                pubkey,
+                signature,
+                message,
+            } => {
+                sqlx::query("insert into auth_pubkey (pubkey) values ($1) on conflict do nothing")
+                    .bind(pubkey.0)
+                    .execute(&mut txn)
+                    .await?;
+            }
+        }
+
         txn.commit().await?;
         Ok(Ok(()))
     }
@@ -280,13 +332,60 @@ impl BinderCoreV2 {
         password: &str,
     ) -> anyhow::Result<Result<(), AuthError>> {
         if !self.verify_password(username, password).await? {
-            return Ok(Err(AuthError::InvalidUsernameOrPassword));
+            return Ok(Err(AuthError::InvalidCredentials));
         }
         let mut txn = self.postgres.begin().await?;
         sqlx::query("delete from users where username = $1")
             .bind(username)
             .execute(&mut txn)
             .await?;
+        txn.commit().await?;
+        Ok(Ok(()))
+    }
+
+    /// Deletes a user.
+    pub async fn delete_user_v2(
+        &self,
+        credentials: Credentials,
+    ) -> anyhow::Result<Result<(), AuthError>> {
+        if !self.verify(credentials.clone()).await? {
+            return Ok(Err(AuthError::InvalidCredentials));
+        }
+
+        let userid = self
+            .get_user_info_v2(credentials.clone())
+            .await?
+            .expect("User not found")
+            .userid;
+        let mut txn = self.postgres.begin().await?;
+
+        match credentials {
+            Credentials::Password { username, password } => {
+                sqlx::query("delete from users where userid = $1")
+                    .bind(userid)
+                    .execute(&mut txn)
+                    .await?;
+                sqlx::query("delete from auth_password where username = $1")
+                    .bind(username.as_str())
+                    .execute(&mut txn)
+                    .await?;
+            }
+            Credentials::Signature {
+                pubkey,
+                signature,
+                message,
+            } => {
+                sqlx::query("delete from users where userid = $1")
+                    .bind(userid)
+                    .execute(&mut txn)
+                    .await?;
+                sqlx::query("delete from auth_pubkey where username = $1")
+                    .bind(pubkey.0)
+                    .execute(&mut txn)
+                    .await?;
+            }
+        }
+
         txn.commit().await?;
         Ok(Ok(()))
     }
@@ -552,7 +651,7 @@ impl BinderCoreV2 {
         let user_info = if let Some(user_info) = self.get_user_info(&auth_req.username).await? {
             user_info
         } else {
-            return Ok(Err(AuthError::InvalidUsernameOrPassword));
+            return Ok(Err(AuthError::InvalidCredentials));
         };
 
         if user_info
@@ -569,7 +668,7 @@ impl BinderCoreV2 {
             .verify_password(&auth_req.username, &auth_req.password)
             .await?
         {
-            return Ok(Err(AuthError::InvalidUsernameOrPassword));
+            return Ok(Err(AuthError::InvalidCredentials));
         }
         let key = self.get_mizaru_sk(auth_req.level).await;
         let real_epoch = mizaru::time_to_epoch(SystemTime::now());
@@ -619,12 +718,12 @@ impl BinderCoreV2 {
             if let Some(user_info) = self.get_user_info_v2(auth_req.credentials.clone()).await? {
                 user_info
             } else {
-                return Ok(Err(AuthError::InvalidUsernameOrPassword));
+                return Ok(Err(AuthError::InvalidCredentials));
             };
 
         // Authenticate
         if !self.verify(auth_req.credentials.clone()).await? {
-            return Ok(Err(AuthError::InvalidUsernameOrPassword));
+            return Ok(Err(AuthError::InvalidCredentials));
         }
 
         let key = self.get_mizaru_sk(auth_req.level).await;

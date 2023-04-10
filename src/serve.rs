@@ -11,9 +11,9 @@ use bytes::Bytes;
 use futures_lite::Future;
 
 use geph4_protocol::binder::protocol::{
-    box_decrypt, box_encrypt, AuthError, AuthRequest, AuthResponse, BinderProtocol, BinderService,
-    BlindToken, BridgeDescriptor, Captcha, Level, MasterSummary, MiscFatalError, RegisterError,
-    RpcError, AuthRequestV2, AuthResponseV2,
+    box_decrypt, box_encrypt, AuthError, AuthRequest, AuthRequestV2, AuthResponse, AuthResponseV2,
+    BinderProtocol, BinderService, BlindToken, BridgeDescriptor, Captcha, Credentials, Level,
+    MasterSummary, MiscFatalError, RegisterError, RpcError,
 };
 use melnet2::{wire::http::HttpBackhaul, Backhaul};
 use nanorpc::{DynRpcTransport, JrpcRequest, JrpcResponse, RpcService, RpcTransport};
@@ -112,8 +112,26 @@ impl BinderProtocol for BinderCoreWrapper {
         .await
     }
 
+    /// Registers a new user.
+    async fn register_user_v2(
+        &self,
+        credentials: Credentials,
+        captcha_id: SmolStr,
+        captcha_soln: SmolStr,
+    ) -> Result<(), RegisterError> {
+        backoff(|| {
+            self.core_v2
+                .create_user_v2(credentials.clone(), &captcha_id, &captcha_soln)
+        })
+        .await
+    }
+
     async fn delete_user(&self, username: SmolStr, password: SmolStr) -> Result<(), AuthError> {
         backoff(|| self.core_v2.delete_user(&username, &password)).await
+    }
+
+    async fn delete_user_v2(&self, credentials: Credentials) -> Result<(), AuthError> {
+        backoff(|| self.core_v2.delete_user_v2(credentials.clone())).await
     }
 
     async fn add_bridge_route(
