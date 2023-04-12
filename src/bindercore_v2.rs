@@ -25,6 +25,7 @@ use itertools::Itertools;
 
 use moka::sync::Cache;
 use once_cell::sync::Lazy;
+use postgres::error::DbError;
 use reqwest::StatusCode;
 use rusty_pool::ThreadPool;
 use semver::Version;
@@ -270,19 +271,22 @@ impl BinderCoreV2 {
         captcha_id: &str,
         captcha_soln: &str,
     ) -> anyhow::Result<Result<(), RegisterError>> {
-        // // EMERGENCY
+        // EMERGENCY
         // return Ok(Err(RegisterError::Other("too many requests".into())));
+
         if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
             log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
             return Ok(Err(RegisterError::Other("incorrect captcha".into())));
         }
-        // TODO atomicity
+
+        // // TODO atomicity
         if self.get_user_info_v2(credentials.clone()).await?.is_some() {
             return Ok(Err(RegisterError::DuplicateCredentials));
         }
 
         let mut txn = self.postgres.begin().await?;
-        let row = sqlx::query(
+
+        let row= sqlx::query(
             "insert into users (freebalance, createtime) values ($1, $2) on conflict do nothing returning id"
         )
             .bind(1000i32)
@@ -304,8 +308,8 @@ impl BinderCoreV2 {
             }
             Credentials::Signature {
                 pubkey,
-                signature,
-                message,
+                signature: _,
+                message: _,
             } => {
                 sqlx::query("insert into auth_pubkey (user_id, pubkey) values ($1, $2) on conflict do nothing")
                     .bind(user_id)
@@ -316,6 +320,8 @@ impl BinderCoreV2 {
         }
 
         txn.commit().await?;
+
+        log::info!("successfully created a new user!");
         Ok(Ok(()))
     }
 
@@ -832,7 +838,6 @@ impl BinderCoreV2 {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let diff = now - sig_time;
 
-
         if diff > SIG_WINDOW_SEC {
             Ok(false)
         } else {
@@ -913,6 +918,8 @@ impl BinderCoreV2 {
             }
         };
 
+        println!("get user info res: {:?}", res);
+
         let (userid,) = if let Some(res) = res {
             res
         } else {
@@ -942,11 +949,9 @@ async fn verify_captcha(
     captcha_id: &str,
     solution: &str,
 ) -> anyhow::Result<bool> {
-    log::debug!(
+    println!(
         "verify_captcha({}, {}, {})",
-        captcha_service,
-        captcha_id,
-        solution
+        captcha_service, captcha_id, solution
     );
     // call out to the microservice
     let resp = reqwest::get(&format!(
