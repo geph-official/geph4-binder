@@ -26,6 +26,7 @@ use itertools::Itertools;
 use moka::sync::Cache;
 use once_cell::sync::Lazy;
 use postgres::error::DbError;
+use rand::{distributions::Alphanumeric, Rng};
 use reqwest::StatusCode;
 use rusty_pool::ThreadPool;
 use semver::Version;
@@ -286,9 +287,20 @@ impl BinderCoreV2 {
 
         let mut txn = self.postgres.begin().await?;
 
+        // NOTE: Generate a random meaningless value as placeholders.
+        // This will be removed once the `username` and `pwdhash` columns are removed in the future.
+        let rand: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(7)
+            .map(char::from)
+            .collect();
+        let random_str = format!("PLACEHOLDER-{rand}");
+
         let row= sqlx::query(
-            "insert into users (freebalance, createtime) values ($1, $2) on conflict do nothing returning id"
+            "insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4) on conflict do nothing returning id"
         )
+            .bind(random_str.clone())
+            .bind(random_str)
             .bind(1000i32)
             .bind(Utc::now().naive_utc())
             .fetch_one(&mut txn)
