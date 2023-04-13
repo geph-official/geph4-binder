@@ -379,36 +379,14 @@ impl BinderCoreV2 {
             .await?
             .ok_or(AuthError::InvalidCredentials)?
             .userid;
+
         let mut txn = self.postgres.begin().await?;
-
-        match credentials {
-            Credentials::Password {
-                username: _,
-                password: _,
-            } => {
-                sqlx::query("delete from auth_password where user_id = $1")
-                    .bind(user_id)
-                    .execute(&mut txn)
-                    .await?;
-            }
-            Credentials::Signature {
-                pubkey: _,
-                signature: _,
-                message: _,
-            } => {
-                sqlx::query("delete from auth_pubkey where user_id = $1")
-                    .bind(user_id)
-                    .execute(&mut txn)
-                    .await?;
-            }
-        }
-
         sqlx::query("delete from users where id = $1")
             .bind(user_id)
             .execute(&mut txn)
             .await?;
-
         txn.commit().await?;
+
         log::info!("successfully deleted user: {:?}", user_id);
 
         Ok(Ok(()))
