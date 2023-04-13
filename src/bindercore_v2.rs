@@ -374,7 +374,7 @@ impl BinderCoreV2 {
             return Ok(Err(AuthError::InvalidCredentials));
         }
 
-        let userid = self
+        let user_id = self
             .get_user_info_v2(credentials.clone())
             .await?
             .ok_or(AuthError::InvalidCredentials)?
@@ -382,33 +382,35 @@ impl BinderCoreV2 {
         let mut txn = self.postgres.begin().await?;
 
         match credentials {
-            Credentials::Password { username, password } => {
-                sqlx::query("delete from users where userid = $1")
-                    .bind(userid)
-                    .execute(&mut txn)
-                    .await?;
-                sqlx::query("delete from auth_password where userid = $1")
-                    .bind(userid)
+            Credentials::Password {
+                username: _,
+                password: _,
+            } => {
+                sqlx::query("delete from auth_password where user_id = $1")
+                    .bind(user_id)
                     .execute(&mut txn)
                     .await?;
             }
             Credentials::Signature {
-                pubkey,
-                signature,
-                message,
+                pubkey: _,
+                signature: _,
+                message: _,
             } => {
-                sqlx::query("delete from users where userid = $1")
-                    .bind(userid)
-                    .execute(&mut txn)
-                    .await?;
-                sqlx::query("delete from auth_pubkey where userid = $1")
-                    .bind(userid)
+                sqlx::query("delete from auth_pubkey where user_id = $1")
+                    .bind(user_id)
                     .execute(&mut txn)
                     .await?;
             }
         }
 
+        sqlx::query("delete from users where id = $1")
+            .bind(user_id)
+            .execute(&mut txn)
+            .await?;
+
         txn.commit().await?;
+        log::info!("successfully deleted user: {:?}", user_id);
+
         Ok(Ok(()))
     }
 
