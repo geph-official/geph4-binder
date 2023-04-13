@@ -3,16 +3,14 @@ CREATE TABLE IF NOT EXISTS auth_password(
        user_id INT NOT NULL,
        pwdhash TEXT NOT NULL,
        PRIMARY KEY user_id,
-       FOREIGN KEY (user_id) REFERENCES users(id),
-       CASCADE ON DELETE,
+       FOREIGN KEY (user_id) REFERENCES users(id) CASCADE ON DELETE,
 );
 
 CREATE TABLE IF NOT EXISTS auth_pubkey(
        user_id INT NOT NULL,
        pubkey TEXT NOT NULL,
        PRIMARY KEY user_id,
-       FOREIGN KEY (user_id) REFERENCES users(id)
-       CASCADE ON DELETE,
+       FOREIGN KEY (user_id) REFERENCES users(id) CASCADE ON DELETE,
 );
 
 -- copy over data from users --

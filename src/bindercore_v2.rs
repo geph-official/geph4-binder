@@ -275,10 +275,10 @@ impl BinderCoreV2 {
         // EMERGENCY
         // return Ok(Err(RegisterError::Other("too many requests".into())));
 
-        if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
-            log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
-            return Ok(Err(RegisterError::Other("incorrect captcha".into())));
-        }
+        // if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
+        //     log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
+        //     return Ok(Err(RegisterError::Other("incorrect captcha".into())));
+        // }
 
         // // TODO atomicity
         if self.get_user_info_v2(credentials.clone()).await?.is_some() {
