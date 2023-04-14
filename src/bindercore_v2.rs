@@ -241,28 +241,15 @@ impl BinderCoreV2 {
         captcha_id: &str,
         captcha_soln: &str,
     ) -> anyhow::Result<Result<(), RegisterError>> {
-        // // EMERGENCY
-        // return Ok(Err(RegisterError::Other("too many requests".into())));
-        if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
-            log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
-            return Ok(Err(RegisterError::Other("incorrect captcha".into())));
-        }
-        // TODO atomicity
-        if self.get_user_info(username).await?.is_some() {
-            return Ok(Err(RegisterError::DuplicateCredentials));
-        }
-        let mut txn = self.postgres.begin().await?;
-        sqlx::query(
-            "insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4) on conflict do nothing",
+        self.create_user_v2(
+            Credentials::Password {
+                username: username.into(),
+                password: password.into(),
+            },
+            captcha_id,
+            captcha_soln,
         )
-        .bind(username)
-        .bind(hash_libsodium_password(password).await)
-        .bind(1000i32)
-        .bind(Utc::now().naive_utc())
-        .execute(&mut txn)
-        .await?;
-        txn.commit().await?;
-        Ok(Ok(()))
+        .await
     }
 
     /// Creates a new user, consuming a captcha answer.
@@ -275,10 +262,10 @@ impl BinderCoreV2 {
         // EMERGENCY
         // return Ok(Err(RegisterError::Other("too many requests".into())));
 
-        // if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
-        //     log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
-        //     return Ok(Err(RegisterError::Other("incorrect captcha".into())));
-        // }
+        if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
+            log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
+            return Ok(Err(RegisterError::Other("incorrect captcha".into())));
+        }
 
         // // TODO atomicity
         if self.get_user_info_v2(credentials.clone()).await?.is_some() {
@@ -299,8 +286,8 @@ impl BinderCoreV2 {
         let row= sqlx::query(
             "insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4) on conflict do nothing returning id"
         )
-            .bind(random_str.clone())
-            .bind(random_str)
+            .bind(if let Credentials::Password { username, password: _ } = &credentials {username.to_string()} else {random_str.clone()})
+            .bind(if let Credentials::Password { username: _, password } = &credentials {password.to_string()} else {random_str.clone()})
             .bind(1000i32)
             .bind(Utc::now().naive_utc())
             .fetch_one(&mut txn)

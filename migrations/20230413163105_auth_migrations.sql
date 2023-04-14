@@ -1,16 +1,15 @@
 -- Add migration script here
-CREATE TABLE IF NOT EXISTS auth_password(
-       user_id INT NOT NULL,
+CREATE TABLE IF NOT EXISTS auth_password (
+       user_id INT NOT NULL PRIMARY KEY,
+       username TEXT NOT NULL,
        pwdhash TEXT NOT NULL,
-       PRIMARY KEY user_id,
-       FOREIGN KEY (user_id) REFERENCES users(id) CASCADE ON DELETE,
+       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS auth_pubkey(
-       user_id INT NOT NULL,
+       user_id INT NOT NULL PRIMARY KEY,
        pubkey TEXT NOT NULL,
-       PRIMARY KEY user_id,
-       FOREIGN KEY (user_id) REFERENCES users(id) CASCADE ON DELETE,
+       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 -- copy over data from users --
