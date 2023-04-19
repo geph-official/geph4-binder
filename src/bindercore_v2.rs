@@ -68,6 +68,9 @@ pub struct BinderCoreV2 {
     // caches bridges *per key*
     bridge_per_key: Cache<blake3::Hash, Vec<BridgeDescriptor>>,
 
+    // caches *wrong* passwords
+    pwd_cache: Cache<(SmolStr, SmolStr), bool>,
+
     // caches the "premium routes"
     premium_route_cache: Cache<(), imbl::HashSet<SmolStr>>,
 
@@ -109,11 +112,22 @@ impl BinderCoreV2 {
             let statsd_client = statsd_client.clone();
             smolscale::spawn(async move {
                 loop {
-                    smol::Timer::after(Duration::from_secs(fastrand::u64(300..1200))).await;
-                    let (count,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
+                    smol::Timer::after(Duration::from_secs(fastrand::u64(0..600))).await;
+                    sqlx::query(
+                        "delete from routes where update_time < NOW() - interval '3 minute'",
+                    )
+                    .execute(&postgres)
+                    .await
+                    .unwrap();
+                    let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
                     .fetch_one(& postgres)
                     .await.unwrap();
-                    statsd_client.gauge("usercount", count as f64);
+                    let (subcount,): (i64,) = sqlx::query_as("select count(*) from subscriptions")
+                        .fetch_one(&postgres)
+                        .await
+                        .unwrap();
+                    statsd_client.gauge("usercount", usercount as f64);
+                    statsd_client.gauge("subcount", subcount as f64);
                 }
             })
         };
@@ -154,6 +168,8 @@ impl BinderCoreV2 {
             statsd_client,
 
             validate_cache: Cache::new(100000),
+
+            pwd_cache: Cache::new(100000),
 
             _task,
         })
@@ -281,17 +297,13 @@ impl BinderCoreV2 {
             .take(7)
             .map(char::from)
             .collect();
-        let random_str = format!("PLACEHOLDER-{rand}");
 
-        let row= sqlx::query(
-            "insert into users (username, pwdhash, freebalance, createtime) values ($1, $2, $3, $4) on conflict do nothing returning id"
+        let row = sqlx::query(
+            "insert into users (createtime) values ($1) on conflict do nothing returning id",
         )
-            .bind(if let Credentials::Password { username, password: _ } = &credentials {username.to_string()} else {random_str.clone()})
-            .bind(if let Credentials::Password { username: _, password } = &credentials {password.to_string()} else {random_str.clone()})
-            .bind(1000i32)
-            .bind(Utc::now().naive_utc())
-            .fetch_one(&mut txn)
-            .await?;
+        .bind(Utc::now().naive_utc())
+        .fetch_one(&mut txn)
+        .await?;
         let user_id: i32 = row.get(0);
 
         match credentials {
@@ -340,16 +352,11 @@ impl BinderCoreV2 {
         username: &str,
         password: &str,
     ) -> anyhow::Result<Result<(), AuthError>> {
-        if !self.verify_password(username, password).await? {
-            return Ok(Err(AuthError::InvalidCredentials));
-        }
-        let mut txn = self.postgres.begin().await?;
-        sqlx::query("delete from users where username = $1")
-            .bind(username)
-            .execute(&mut txn)
-            .await?;
-        txn.commit().await?;
-        Ok(Ok(()))
+        self.delete_user_v2(Credentials::Password {
+            username: username.into(),
+            password: password.into(),
+        })
+        .await
     }
 
     /// Deletes a user.
@@ -637,7 +644,7 @@ impl BinderCoreV2 {
             return Ok(Ok(val));
         }
 
-        let user_info = if let Some(user_info) = self.get_user_info(&auth_req.username).await? {
+        let user_info = if let Some(user_info) = self.get_user_info_v1(&auth_req.username).await? {
             user_info
         } else {
             return Ok(Err(AuthError::InvalidCredentials));
@@ -787,6 +794,9 @@ impl BinderCoreV2 {
 
     /// Verifies the password.
     async fn verify_password(&self, username: &str, password: &str) -> anyhow::Result<bool> {
+        if let Some(val) = self.pwd_cache.get(&(username.into(), password.into())) {
+            return Ok(val);
+        }
         let mut txn = self.postgres.begin().await?;
         let (pwdhash,): (String,) = if let Some(v) =
             sqlx::query_as("select pwdhash from auth_password where username = $1")
@@ -799,8 +809,12 @@ impl BinderCoreV2 {
             return Ok(false);
         };
         if verify_libsodium_password(password.to_string(), pwdhash).await {
+            self.pwd_cache
+                .insert((username.into(), password.into()), true);
             Ok(true)
         } else {
+            self.pwd_cache
+                .insert((username.into(), password.into()), false);
             Ok(false)
         }
     }
@@ -843,10 +857,10 @@ impl BinderCoreV2 {
     }
 
     /// Obtain the user info given the username.
-    async fn get_user_info(&self, username: &str) -> Result<Option<UserInfo>, sqlx::Error> {
+    async fn get_user_info_v1(&self, username: &str) -> Result<Option<UserInfo>, sqlx::Error> {
         let mut txn = self.postgres.begin().await?;
         let res: Option<(i32, String, String)> =
-            sqlx::query_as("select id,username,pwdhash from users where username = $1")
+            sqlx::query_as("select id,username,pwdhash from users_legacy where username = $1")
                 .bind(username)
                 .fetch_optional(&mut txn)
                 .await?;
