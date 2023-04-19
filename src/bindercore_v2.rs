@@ -15,9 +15,9 @@ use futures_util::{future::Shared, FutureExt};
 
 use geph4_protocol::{
     binder::protocol::{
-        AuthError, AuthRequest, AuthRequestV2, AuthResponse, AuthResponseV2, BlindToken,
-        BridgeDescriptor, Captcha, Credentials, ExitDescriptor, Level, MasterSummary,
-        RegisterError, SubscriptionInfo, UserInfo, UserInfoV2, AUTH_MSG_PREFIX,
+        verify_pk_auth, AuthError, AuthRequest, AuthRequestV2, AuthResponse, AuthResponseV2,
+        BlindToken, BridgeDescriptor, Captcha, Credentials, ExitDescriptor, Level, MasterSummary,
+        RegisterError, SubscriptionInfo, UserInfo, UserInfoV2,
     },
     bridge_exit::{BridgeExitClient, BridgeExitTransport},
 };
@@ -25,7 +25,7 @@ use itertools::Itertools;
 
 use moka::sync::Cache;
 use once_cell::sync::Lazy;
-use postgres::error::DbError;
+
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::StatusCode;
 use rusty_pool::ThreadPool;
@@ -39,11 +39,8 @@ use sqlx::{
     FromRow, PgPool, Row,
 };
 use tap::Tap;
-use tmelcrypt::Ed25519PK;
 
 use crate::POOL_SIZE;
-
-const SIG_WINDOW_SEC: u64 = 3600;
 
 pub struct BinderCoreV2 {
     captcha_service_url: SmolStr,
@@ -292,7 +289,7 @@ impl BinderCoreV2 {
 
         // NOTE: Generate a random meaningless value as placeholders.
         // This will be removed once the `username` and `pwdhash` columns are removed in the future.
-        let rand: String = rand::thread_rng()
+        let _rand: String = rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(7)
             .map(char::from)
@@ -317,11 +314,7 @@ impl BinderCoreV2 {
                     .execute(&mut txn)
                     .await?;
             }
-            Credentials::Signature {
-                pubkey,
-                signature: _,
-                message: _,
-            } => {
+            Credentials::Signature { pubkey, .. } => {
                 sqlx::query("insert into auth_pubkey (user_id, pubkey) values ($1, $2) on conflict do nothing")
                     .bind(user_id)
                     .bind(pubkey.0)
@@ -786,9 +779,9 @@ impl BinderCoreV2 {
             }
             Credentials::Signature {
                 pubkey,
+                unix_secs,
                 signature,
-                message,
-            } => self.verify_signature(pubkey, signature, &message).await,
+            } => Ok(verify_pk_auth(pubkey, unix_secs, &signature)),
         }
     }
 
@@ -816,25 +809,6 @@ impl BinderCoreV2 {
             self.pwd_cache
                 .insert((username.into(), password.into()), false);
             Ok(false)
-        }
-    }
-
-    /// Verifies the signature
-    async fn verify_signature(
-        &self,
-        pubkey: Ed25519PK,
-        signature: Vec<u8>,
-        message: &str,
-    ) -> anyhow::Result<bool> {
-        let sig_time = str::replace(message, AUTH_MSG_PREFIX, "");
-        let sig_time: u64 = sig_time.parse()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let diff = now - sig_time;
-
-        if diff > SIG_WINDOW_SEC {
-            Ok(false)
-        } else {
-            Ok(pubkey.verify(message.as_bytes(), &signature))
         }
     }
 
@@ -893,17 +867,16 @@ impl BinderCoreV2 {
     ) -> Result<Option<UserInfoV2>, sqlx::Error> {
         let mut txn = self.postgres.begin().await?;
         let res: Option<(i32,)> = match credentials {
-            Credentials::Password { username, password } => {
+            Credentials::Password {
+                username,
+                password: _,
+            } => {
                 sqlx::query_as("select user_id from auth_password where username = $1")
                     .bind(username.as_str())
                     .fetch_optional(&mut txn)
                     .await?
             }
-            Credentials::Signature {
-                pubkey,
-                signature,
-                message,
-            } => {
+            Credentials::Signature { pubkey, .. } => {
                 sqlx::query_as("select user_id from auth_pubkey where pubkey = $1")
                     .bind(pubkey.to_string())
                     .fetch_optional(&mut txn)
