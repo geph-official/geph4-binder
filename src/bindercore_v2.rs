@@ -33,6 +33,7 @@ use semver::Version;
 use smol::Task;
 use smol_str::SmolStr;
 use smol_timeout::TimeoutExt;
+use sosistab2::{MuxPublic, ObfsUdpPublic};
 use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
@@ -404,13 +405,14 @@ impl BinderCoreV2 {
         if bridge.update_time + 1000 < (SystemTime::now().duration_since(UNIX_EPOCH)?).as_secs() {
             anyhow::bail!("too old")
         }
+
         // insert into the system
         let mut txn = self.postgres.begin().await?;
         // HACK: we encode the protocol into the allocation group name
-        sqlx::query("insert into routes (hostname, sosistab_pubkey, bridge_address, bridge_group, update_time) values ($1, $2, $3, $4, $5) on conflict (bridge_address, bridge_group) do
-        update set hostname = excluded.hostname, sosistab_pubkey = excluded.sosistab_pubkey, bridge_group = excluded.bridge_group, update_time = excluded.update_time")
+        sqlx::query("insert into bridge_routes (hostname, cookie, bridge_address, bridge_group, update_time) values ($1, $2, $3, $4, $5) on conflict (bridge_address, bridge_group) do
+        update set hostname = excluded.hostname, cookie = excluded.cookie, bridge_group = excluded.bridge_group, update_time = excluded.update_time")
         .bind(bridge.exit_hostname.as_str())
-        .bind(bridge.sosistab_key.to_vec())
+        .bind(bridge.cookie.to_vec())
         .bind(bridge.endpoint.to_string())
         .bind(format!("{}!!{}", if bridge.is_direct{"direct"} else {&bridge.alloc_group}, bridge.protocol))
         .bind(DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(bridge.update_time)).naive_utc())
@@ -520,6 +522,7 @@ impl BinderCoreV2 {
         token: BlindToken,
         exit: SmolStr,
         validate: bool,
+        is_legacy: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
         self.statsd_client.incr(&format!(
             "gb_versions.{}",
@@ -546,17 +549,31 @@ impl BinderCoreV2 {
                 bunch
             } else {
                 let mut txn = self.postgres.begin().await?;
-                let rows: Vec<(String, Vec<u8>, String, String, f64)> = sqlx::query_as("select hostname, sosistab_pubkey, bridge_address, bridge_group, extract(epoch from update_time) from routes where hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
+                let rows: Vec<(String, Vec<u8>, String, String, f64)> = sqlx::query_as("select hostname, cookie, bridge_address, bridge_group, extract(epoch from update_time) from bridge_routes where hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
+                let sosistab2_pk: (Vec<u8>,) =
+                    sqlx::query_as("select sosistab_key from exits where hostname = $1")
+                        .bind(exit.as_str())
+                        .fetch_one(&mut txn)
+                        .await?;
                 let result: Vec<BridgeDescriptor> = rows
                     .into_iter()
                     .map(
-                        |(hostname, sosistab_pubkey, bridge_address, bridge_group, update_time)| {
+                        |(hostname, cookie, bridge_address, bridge_group, update_time)| {
                             let alloc_group: SmolStr =
                                 if let Some((left, _)) = bridge_group.split_once("!!") {
                                     left.into()
                                 } else {
                                     bridge_group.clone().into()
                                 };
+
+                            let cookie_or_tuple: Bytes = if is_legacy {
+                                bincode::serialize(&(cookie.clone(), sosistab2_pk.clone()))
+                                    .unwrap()
+                                    .into()
+                            } else {
+                                cookie.clone().into()
+                            };
+
                             BridgeDescriptor {
                                 is_direct: alloc_group == "direct",
                                 protocol: if let Some((_, right)) = bridge_group.split_once("!!") {
@@ -567,7 +584,7 @@ impl BinderCoreV2 {
                                 endpoint: bridge_address
                                     .parse()
                                     .expect("unparseable bridge address"),
-                                sosistab_key: sosistab_pubkey.into(),
+                                cookie: cookie_or_tuple,
                                 exit_hostname: hostname.into(),
                                 alloc_group,
                                 update_time: update_time as u64,

@@ -152,19 +152,25 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     async fn get_bridges(&self, token: BlindToken, exit: SmolStr) -> Vec<BridgeDescriptor> {
-        backoff(|| self.core_v2.get_bridges(token.clone(), exit.clone(), true))
-            .await
-            .into_iter()
-            .filter(|s| s.protocol == "sosistab")
-            .collect()
+        backoff(|| {
+            self.core_v2
+                .get_bridges(token.clone(), exit.clone(), true, true)
+        })
+        .await
+        .into_iter()
+        .filter(|s| s.protocol == "sosistab")
+        .collect()
     }
 
     async fn get_bridges_v2(&self, token: BlindToken, exit: SmolStr) -> Vec<BridgeDescriptor> {
-        backoff(|| self.core_v2.get_bridges(token.clone(), exit.clone(), true))
-            .await
-            .into_iter()
-            .filter(|s| s.protocol != "sosistab")
-            .collect()
+        backoff(|| {
+            self.core_v2
+                .get_bridges(token.clone(), exit.clone(), true, false)
+        })
+        .await
+        .into_iter()
+        .filter(|s| s.protocol != "sosistab")
+        .collect()
     }
 
     async fn get_mizaru_pk(&self, level: Level) -> mizaru::PublicKey {
