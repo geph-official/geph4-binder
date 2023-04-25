@@ -523,9 +523,9 @@ impl BinderCoreV2 {
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
         #[derive(Debug, FromRow)]
         struct BridgeRouteRecord {
-            exit_hostname: String,
-            bridge: Vec<u8>,
-            update_time: f64,
+            _exit_hostname: String,
+            bridge_descriptor: Vec<u8>,
+            _update_time: f64,
         }
 
         self.statsd_client.incr(&format!(
@@ -553,7 +553,7 @@ impl BinderCoreV2 {
                 bunch
             } else {
                 let mut txn = self.postgres.begin().await?;
-                let records: Vec<BridgeRouteRecord> = sqlx::query_as("select exit_hostname, bridge, extract(epoch from update_time) from bridge_routes where exit_hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
+                let records: Vec<BridgeRouteRecord> = sqlx::query_as("select exit_hostname, bridge_descriptor, extract(epoch from update_time) from bridge_routes where exit_hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
                 let sosistab2_pk: (Vec<u8>,) =
                     sqlx::query_as("select sosistab_key from exits where hostname = $1")
                         .bind(exit.as_str())
@@ -563,8 +563,9 @@ impl BinderCoreV2 {
                 let result: Vec<BridgeDescriptor> = records
                     .into_iter()
                     .map(|record| {
-                        let mut bridge: BridgeDescriptor = bincode::deserialize(&record.bridge)
-                            .expect("failed to deserialize bridge descriptor from database!");
+                        let mut bridge: BridgeDescriptor =
+                            bincode::deserialize(&record.bridge_descriptor)
+                                .expect("failed to deserialize bridge descriptor from database!");
                         let cookie_or_tuple: Bytes = if is_legacy {
                             bincode::serialize(&(bridge.cookie.clone(), sosistab2_pk.clone()))
                                 .unwrap()
@@ -572,8 +573,8 @@ impl BinderCoreV2 {
                         } else {
                             bridge.cookie.clone().into()
                         };
-
                         bridge.cookie = cookie_or_tuple;
+
                         bridge
                     })
                     .collect();
