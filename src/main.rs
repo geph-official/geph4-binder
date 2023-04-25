@@ -1,4 +1,5 @@
 mod bindercore_v2;
+mod records;
 mod serve;
 
 use env_logger::Env;

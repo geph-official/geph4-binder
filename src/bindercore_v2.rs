@@ -33,15 +33,17 @@ use semver::Version;
 use smol::Task;
 use smol_str::SmolStr;
 use smol_timeout::TimeoutExt;
-use sosistab2::{MuxPublic, ObfsUdpPublic};
 use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
-    FromRow, PgPool, Row,
+    PgPool, Row,
 };
 use tap::Tap;
 
-use crate::POOL_SIZE;
+use crate::{
+    records::{BridgeRouteRecord, ExitRecord},
+    POOL_SIZE,
+};
 
 pub struct BinderCoreV2 {
     captcha_service_url: SmolStr,
@@ -407,9 +409,9 @@ impl BinderCoreV2 {
         }
 
         let mut txn = self.postgres.begin().await?;
-        sqlx::query("INSERT INTO bridge_routes (hostname, bridge, update_time)
-        VALUES ($1, $2, $3) ON CONFLICT (bridge) DO
-        UPDATE SET hostname = excluded.hostname, bridge = excluded.bridge, update_time = excluded.update_time")
+        sqlx::query("INSERT INTO bridge_routes (exit_hostname, descriptor, update_time)
+        VALUES ($1, $2, $3) ON CONFLICT (descriptor) DO
+        UPDATE SET exit_hostname = excluded.hostname, descriptor = excluded.descriptor, update_time = excluded.update_time")
         .bind(bridge.exit_hostname.as_str())
         .bind(bincode::serialize(&bridge)?)
         .bind(DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(bridge.update_time)).naive_utc())
@@ -420,16 +422,6 @@ impl BinderCoreV2 {
 
     /// Obtains the summary of the whole state.
     pub async fn get_summary(&self) -> anyhow::Result<MasterSummary> {
-        #[derive(Debug, FromRow)]
-        struct ExitRecord {
-            hostname: String,
-            signing_key: [u8; 32],
-            country: String,
-            city: String,
-            sosistab_key: [u8; 32],
-            plus: bool,
-        }
-
         if let Some(summary) = self.summary_cache.get(&()) {
             Ok(summary)
         } else {
@@ -443,11 +435,9 @@ impl BinderCoreV2 {
                 self.bridge_secret_cache.insert((), bridge_secret.clone());
                 bridge_secret
             };
-            let qresult: Vec<ExitRecord> = sqlx::query_as(
-                "select hostname,signing_key,country,city,sosistab_key,plus from exits",
-            )
-            .fetch_all(&self.postgres)
-            .await?;
+            let qresult: Vec<ExitRecord> = sqlx::query_as("select * from exits")
+                .fetch_all(&self.postgres)
+                .await?;
 
             let mut exits = qresult
                 .into_iter()
@@ -459,7 +449,7 @@ impl BinderCoreV2 {
                         country_code: exit.country.into(),
                         city_code: exit.city.into(),
                         direct_routes: vec![], // fill in in the future
-                        legacy_direct_sosistab_pk: x25519_dalek::PublicKey::from(exit.sosistab_key),
+                        sosistab_e2e_pk: x25519_dalek::PublicKey::from(exit.sosistab_key),
                         allowed_levels: if exit.plus {
                             vec![Level::Plus]
                         } else {
@@ -521,13 +511,6 @@ impl BinderCoreV2 {
         validate: bool,
         is_legacy: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
-        #[derive(Debug, FromRow)]
-        struct BridgeRouteRecord {
-            _exit_hostname: String,
-            bridge_descriptor: Vec<u8>,
-            _update_time: f64,
-        }
-
         self.statsd_client.incr(&format!(
             "gb_versions.{}",
             token
@@ -553,25 +536,29 @@ impl BinderCoreV2 {
                 bunch
             } else {
                 let mut txn = self.postgres.begin().await?;
-                let records: Vec<BridgeRouteRecord> = sqlx::query_as("select exit_hostname, bridge_descriptor, extract(epoch from update_time) from bridge_routes where exit_hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
-                let sosistab2_pk: (Vec<u8>,) =
+                let records: Vec<BridgeRouteRecord> =
+                    sqlx::query_as("select * from bridge_routes where exit_hostname = $1")
+                        .bind(exit.as_str())
+                        .fetch_all(&mut txn)
+                        .await?;
+                let exit_sosistab2_pk: (Vec<u8>,) =
                     sqlx::query_as("select sosistab_key from exits where hostname = $1")
                         .bind(exit.as_str())
                         .fetch_one(&mut txn)
                         .await?;
-
                 let result: Vec<BridgeDescriptor> = records
                     .into_iter()
                     .map(|record| {
-                        let mut bridge: BridgeDescriptor =
-                            bincode::deserialize(&record.bridge_descriptor)
-                                .expect("failed to deserialize bridge descriptor from database!");
-                        let cookie_or_tuple: Bytes = if is_legacy {
-                            bincode::serialize(&(bridge.cookie.clone(), sosistab2_pk.clone()))
+                        let mut bridge: BridgeDescriptor = bincode::deserialize(&record.descriptor)
+                            .expect("failed to deserialize bridge descriptor from database!");
+                        // If we are in legacy mode, and this is an obfsudp bridge, we encode the sosistab2 e2e key of the exit too
+                        let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp")
+                        {
+                            bincode::serialize(&(bridge.cookie.clone(), exit_sosistab2_pk.clone()))
                                 .unwrap()
                                 .into()
                         } else {
-                            bridge.cookie.clone().into()
+                            bridge.cookie
                         };
                         bridge.cookie = cookie_or_tuple;
 
