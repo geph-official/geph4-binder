@@ -406,15 +406,12 @@ impl BinderCoreV2 {
             anyhow::bail!("too old")
         }
 
-        // insert into the system
         let mut txn = self.postgres.begin().await?;
-        // HACK: we encode the protocol into the allocation group name
-        sqlx::query("insert into bridge_routes (hostname, cookie, bridge_address, bridge_group, update_time) values ($1, $2, $3, $4, $5) on conflict (bridge_address, bridge_group) do
-        update set hostname = excluded.hostname, cookie = excluded.cookie, bridge_group = excluded.bridge_group, update_time = excluded.update_time")
+        sqlx::query("INSERT INTO bridge_routes (hostname, bridge, update_time)
+        VALUES ($1, $2, $3) ON CONFLICT (bridge) DO
+        UPDATE SET hostname = excluded.hostname, bridge = excluded.bridge, update_time = excluded.update_time")
         .bind(bridge.exit_hostname.as_str())
-        .bind(bridge.cookie.to_vec())
-        .bind(bridge.endpoint.to_string())
-        .bind(format!("{}!!{}", if bridge.is_direct{"direct"} else {&bridge.alloc_group}, bridge.protocol))
+        .bind(bincode::serialize(&bridge)?)
         .bind(DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(bridge.update_time)).naive_utc())
         .execute(&mut txn).await?;
         txn.commit().await?;
@@ -524,6 +521,13 @@ impl BinderCoreV2 {
         validate: bool,
         is_legacy: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
+        #[derive(Debug, FromRow)]
+        struct BridgeRouteRecord {
+            exit_hostname: String,
+            bridge: Vec<u8>,
+            update_time: f64,
+        }
+
         self.statsd_client.incr(&format!(
             "gb_versions.{}",
             token
@@ -549,49 +553,29 @@ impl BinderCoreV2 {
                 bunch
             } else {
                 let mut txn = self.postgres.begin().await?;
-                let rows: Vec<(String, Vec<u8>, String, String, f64)> = sqlx::query_as("select hostname, cookie, bridge_address, bridge_group, extract(epoch from update_time) from bridge_routes where hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
+                let records: Vec<BridgeRouteRecord> = sqlx::query_as("select exit_hostname, bridge, extract(epoch from update_time) from bridge_routes where exit_hostname = $1").bind(exit.as_str()).fetch_all(&mut txn).await?;
                 let sosistab2_pk: (Vec<u8>,) =
                     sqlx::query_as("select sosistab_key from exits where hostname = $1")
                         .bind(exit.as_str())
                         .fetch_one(&mut txn)
                         .await?;
-                let result: Vec<BridgeDescriptor> = rows
+
+                let result: Vec<BridgeDescriptor> = records
                     .into_iter()
-                    .map(
-                        |(hostname, cookie, bridge_address, bridge_group, update_time)| {
-                            let alloc_group: SmolStr =
-                                if let Some((left, _)) = bridge_group.split_once("!!") {
-                                    left.into()
-                                } else {
-                                    bridge_group.clone().into()
-                                };
+                    .map(|record| {
+                        let mut bridge: BridgeDescriptor = bincode::deserialize(&record.bridge)
+                            .expect("failed to deserialize bridge descriptor from database!");
+                        let cookie_or_tuple: Bytes = if is_legacy {
+                            bincode::serialize(&(bridge.cookie.clone(), sosistab2_pk.clone()))
+                                .unwrap()
+                                .into()
+                        } else {
+                            bridge.cookie.clone().into()
+                        };
 
-                            let cookie_or_tuple: Bytes = if is_legacy {
-                                bincode::serialize(&(cookie.clone(), sosistab2_pk.clone()))
-                                    .unwrap()
-                                    .into()
-                            } else {
-                                cookie.clone().into()
-                            };
-
-                            BridgeDescriptor {
-                                is_direct: alloc_group == "direct",
-                                protocol: if let Some((_, right)) = bridge_group.split_once("!!") {
-                                    right.into()
-                                } else {
-                                    "sosistab".into()
-                                },
-                                endpoint: bridge_address
-                                    .parse()
-                                    .expect("unparseable bridge address"),
-                                cookie: cookie_or_tuple,
-                                exit_hostname: hostname.into(),
-                                alloc_group,
-                                update_time: update_time as u64,
-                                exit_signature: Bytes::new(), // it's not like the client actually checks this lol
-                            }
-                        },
-                    )
+                        bridge.cookie = cookie_or_tuple;
+                        bridge
+                    })
                     .collect();
                 self.bridge_per_exit_cache.insert(exit, result.clone());
                 result
