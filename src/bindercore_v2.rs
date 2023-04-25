@@ -411,7 +411,7 @@ impl BinderCoreV2 {
         let mut txn = self.postgres.begin().await?;
         sqlx::query("INSERT INTO bridge_routes (exit_hostname, descriptor, update_time)
         VALUES ($1, $2, $3) ON CONFLICT (descriptor) DO
-        UPDATE SET exit_hostname = excluded.hostname, descriptor = excluded.descriptor, update_time = excluded.update_time")
+        UPDATE SET exit_hostname = excluded.exit_hostname, descriptor = excluded.descriptor, update_time = excluded.update_time")
         .bind(bridge.exit_hostname.as_str())
         .bind(bincode::serialize(&bridge)?)
         .bind(DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(bridge.update_time)).naive_utc())
