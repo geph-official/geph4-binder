@@ -9,7 +9,7 @@ use std::{
 use anyhow::Context;
 use async_compat::CompatExt;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use dashmap::DashMap;
 use futures_util::{future::Shared, FutureExt};
 
@@ -40,11 +40,7 @@ use sqlx::{
 };
 use tap::Tap;
 
-use crate::{
-    bridge_store::BridgeStore,
-    records::{BridgeRouteRecord, ExitRecord},
-    POOL_SIZE,
-};
+use crate::{bridge_store::BridgeStore, records::ExitRecord, POOL_SIZE};
 
 pub struct BinderCoreV2 {
     captcha_service_url: SmolStr,
@@ -63,13 +59,11 @@ pub struct BinderCoreV2 {
     // caches the per-epoch key
     epoch_key_cache: Cache<(Level, usize), rsa::RSAPublicKey>,
 
-    // caches bridges *per exit*
-    bridge_per_exit_cache: Cache<SmolStr, Vec<BridgeDescriptor>>,
-
     // caches bridges *per key*
     bridge_per_key: Cache<blake3::Hash, Vec<BridgeDescriptor>>,
 
-    bridge_store: BridgeStore,
+    // in-memory store for bridge descriptors
+    bridge_store: Arc<BridgeStore>,
 
     // caches *wrong* passwords
     pwd_cache: Cache<(SmolStr, SmolStr), bool>,
@@ -110,18 +104,19 @@ impl BinderCoreV2 {
             )
             .await?;
 
+        let bridge_store = Arc::new(BridgeStore::default());
+
         let _task = {
             let postgres = postgres.clone();
             let statsd_client = statsd_client.clone();
+            let bridge_store = bridge_store.clone();
             smolscale::spawn(async move {
                 loop {
                     smol::Timer::after(Duration::from_secs(fastrand::u64(0..600))).await;
-                    sqlx::query(
-                        "delete from routes where update_time < NOW() - interval '3 minute'",
-                    )
-                    .execute(&postgres)
-                    .await
-                    .unwrap();
+
+                    // clean up old bridges
+                    bridge_store.delete_expired_bridges(180);
+
                     let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
                     .fetch_one(& postgres)
                     .await.unwrap();
@@ -136,26 +131,30 @@ impl BinderCoreV2 {
         };
         Ok(Self {
             captcha_service_url: captcha_service_url.into(),
+
             mizaru_sk: Default::default(),
 
             summary_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(600))
                 .build(),
+
             auth_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(3600))
                 .max_capacity(100000)
                 .build(),
+
             auth_cache_v2: Cache::builder()
                 .time_to_live(Duration::from_secs(3600))
                 .max_capacity(100000)
                 .build(),
+
             epoch_key_cache: Cache::new(10000),
-            bridge_per_exit_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(30))
-                .build(),
+
             bridge_per_key: Cache::builder()
                 .time_to_live(Duration::from_secs(30))
                 .build(),
+
+            bridge_store,
 
             bridge_secret_cache: Cache::new(100),
 
@@ -168,6 +167,7 @@ impl BinderCoreV2 {
                 .build(),
 
             postgres,
+
             statsd_client,
 
             validate_cache: Cache::new(100000),
@@ -393,7 +393,10 @@ impl BinderCoreV2 {
             .exits
             .into_iter()
             .find(|s| s.hostname == bridge.exit_hostname)
-            .context("no such exit")?;
+            .context(format!(
+                "no exit found for hostname: {}",
+                bridge.exit_hostname
+            ))?;
         // now we verify the signature.
         let signed_msg =
             bincode::serialize(&bridge.clone().tap_mut(|d| d.exit_signature = Bytes::new()))
@@ -408,11 +411,11 @@ impl BinderCoreV2 {
             .context(format!("cannot verify signature for bridge {:?}", bridge))?;
         // we check that the time is okay
         if bridge.update_time + 1000 < (SystemTime::now().duration_since(UNIX_EPOCH)?).as_secs() {
-            anyhow::bail!("too old")
+            anyhow::bail!("bridge is too old")
         }
 
         // save the bridge
-        self.bridge_store.add_bridge(bridge);
+        self.bridge_store.add_bridge(&bridge);
 
         Ok(())
     }
@@ -507,11 +510,13 @@ impl BinderCoreV2 {
         exit: SmolStr,
         validate: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
-        let req = VersionReq::parse("<4.7.12").unwrap();
         let is_legacy = if let Some(version) = token.version.clone() {
-            let version = Version::parse(version.as_str()).unwrap();
+            let req = VersionReq::parse("<=4.7.12").unwrap();
+            let version = Version::parse(version.as_str())
+                .expect(format!("failed to parse token version {}", version).as_str());
             req.matches(&version)
         } else {
+            // NOTE: only VERY old clients don't have a version set on their auth tokens
             true
         };
 
@@ -536,7 +541,7 @@ impl BinderCoreV2 {
         }
 
         let mut txn = self.postgres.begin().await?;
-        let exit_sosistab2_pk: (Vec<u8>,) =
+        let sosistab2_e2e_key: (Vec<u8>,) =
             sqlx::query_as("select sosistab_key from exits where hostname = $1")
                 .bind(exit.as_str())
                 .fetch_one(&mut txn)
@@ -548,8 +553,9 @@ impl BinderCoreV2 {
             .iter()
             .map(|bridge| {
                 let mut bridge = bridge.clone();
+                // NOTE: handle legacy calls by encoding both the pipe-specific cookie and the e2e key
                 let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp") {
-                    bincode::serialize(&(bridge.cookie.clone(), exit_sosistab2_pk.clone()))
+                    bincode::serialize(&(bridge.cookie.clone(), sosistab2_e2e_key.clone()))
                         .unwrap()
                         .into()
                 } else {

@@ -31,12 +31,14 @@ pub struct Opt {
     #[structopt(default_value = "https://single-verve-156821.ew.r.appspot.com", long)]
     captcha_endpoint: String,
     /// NOT USED. Kept so that old systemd scripts do not fail with argument not found.
+    #[allow(unused)]
     #[structopt(default_value = "127.0.0.1:18080", long)]
     listen_http: SocketAddr,
     /// New HTTP listening port
     #[structopt(default_value = "0.0.0.0:28080", long)]
     listen_new: SocketAddr,
     /// NOT USED. Kept so that old systemd scripts do not fail with argument not found.
+    #[allow(unused)]
     #[structopt(long, default_value = "127.0.0.1:12345")]
     gfwreport_addr: SocketAddr,
     #[structopt(long, default_value = "172.105.28.221:8125")]
