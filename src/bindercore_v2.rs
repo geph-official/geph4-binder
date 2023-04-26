@@ -511,7 +511,7 @@ impl BinderCoreV2 {
         validate: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
         let is_legacy = if let Some(version) = token.version.clone() {
-            let req = VersionReq::parse("<=4.7.12").unwrap();
+            let req = VersionReq::parse("<=4.7.13").unwrap();
             let version = Version::parse(version.as_str())
                 .expect(format!("failed to parse token version {}", version).as_str());
             req.matches(&version)
