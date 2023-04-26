@@ -29,7 +29,7 @@ use once_cell::sync::Lazy;
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::StatusCode;
 use rusty_pool::ThreadPool;
-use semver::Version;
+use semver::{Version, VersionReq};
 use smol::Task;
 use smol_str::SmolStr;
 use smol_timeout::TimeoutExt;
@@ -41,6 +41,7 @@ use sqlx::{
 use tap::Tap;
 
 use crate::{
+    bridge_store::BridgeStore,
     records::{BridgeRouteRecord, ExitRecord},
     POOL_SIZE,
 };
@@ -67,6 +68,8 @@ pub struct BinderCoreV2 {
 
     // caches bridges *per key*
     bridge_per_key: Cache<blake3::Hash, Vec<BridgeDescriptor>>,
+
+    bridge_store: BridgeStore,
 
     // caches *wrong* passwords
     pwd_cache: Cache<(SmolStr, SmolStr), bool>,
@@ -410,7 +413,7 @@ impl BinderCoreV2 {
 
         let mut txn = self.postgres.begin().await?;
         sqlx::query("INSERT INTO bridge_routes (exit_hostname, descriptor, update_time)
-        VALUES ($1, $2, $3) ON CONFLICT (descriptor) DO
+        VALUES ($1, $2, $3) ON CONFLICT (exit_hostname) DO
         UPDATE SET exit_hostname = excluded.exit_hostname, descriptor = excluded.descriptor, update_time = excluded.update_time")
         .bind(bridge.exit_hostname.as_str())
         .bind(bincode::serialize(&bridge)?)
@@ -509,8 +512,15 @@ impl BinderCoreV2 {
         token: BlindToken,
         exit: SmolStr,
         validate: bool,
-        is_legacy: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
+        let req = VersionReq::parse("<4.0.0").unwrap();
+        let is_legacy = if let Some(version) = token.version.clone() {
+            let version = Version::parse(version.as_str()).unwrap();
+            req.matches(&version)
+        } else {
+            true
+        };
+
         self.statsd_client.incr(&format!(
             "gb_versions.{}",
             token
@@ -552,6 +562,12 @@ impl BinderCoreV2 {
                         let mut bridge: BridgeDescriptor = bincode::deserialize(&record.descriptor)
                             .expect("failed to deserialize bridge descriptor from database!");
                         // If we are in legacy mode, and this is an obfsudp bridge, we encode the sosistab2 e2e key of the exit too
+                        //
+                        println!(
+                            "BRIDGE protocol contains udp: {}",
+                            bridge.protocol.contains("udp")
+                        );
+
                         let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp")
                         {
                             bincode::serialize(&(bridge.cookie.clone(), exit_sosistab2_pk.clone()))

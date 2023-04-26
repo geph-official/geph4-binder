@@ -1,4 +1,5 @@
 mod bindercore_v2;
+mod bridge_store;
 mod records;
 mod serve;
 
