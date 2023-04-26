@@ -411,15 +411,9 @@ impl BinderCoreV2 {
             anyhow::bail!("too old")
         }
 
-        let mut txn = self.postgres.begin().await?;
-        sqlx::query("INSERT INTO bridge_routes (exit_hostname, descriptor, update_time)
-        VALUES ($1, $2, $3) ON CONFLICT (exit_hostname) DO
-        UPDATE SET exit_hostname = excluded.exit_hostname, descriptor = excluded.descriptor, update_time = excluded.update_time")
-        .bind(bridge.exit_hostname.as_str())
-        .bind(bincode::serialize(&bridge)?)
-        .bind(DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(bridge.update_time)).naive_utc())
-        .execute(&mut txn).await?;
-        txn.commit().await?;
+        // save the bridge
+        self.bridge_store.add_bridge(bridge);
+
         Ok(())
     }
 
@@ -513,7 +507,7 @@ impl BinderCoreV2 {
         exit: SmolStr,
         validate: bool,
     ) -> anyhow::Result<Vec<BridgeDescriptor>> {
-        let req = VersionReq::parse("<4.0.0").unwrap();
+        let req = VersionReq::parse("<4.7.12").unwrap();
         let is_legacy = if let Some(version) = token.version.clone() {
             let version = Version::parse(version.as_str()).unwrap();
             req.matches(&version)
@@ -540,51 +534,32 @@ impl BinderCoreV2 {
             log::warn!("got invalid token in get_bridges");
             return Ok(vec![]);
         }
-        // first, we get *all* the bridges that belong to this exit. this is not particularly efficient, but that's somewhat okay
-        let mut all_bridges = {
-            if let Some(bunch) = self.bridge_per_exit_cache.get(&exit) {
-                bunch
-            } else {
-                let mut txn = self.postgres.begin().await?;
-                let records: Vec<BridgeRouteRecord> =
-                    sqlx::query_as("select * from bridge_routes where exit_hostname = $1")
-                        .bind(exit.as_str())
-                        .fetch_all(&mut txn)
-                        .await?;
-                let exit_sosistab2_pk: (Vec<u8>,) =
-                    sqlx::query_as("select sosistab_key from exits where hostname = $1")
-                        .bind(exit.as_str())
-                        .fetch_one(&mut txn)
-                        .await?;
-                let result: Vec<BridgeDescriptor> = records
-                    .into_iter()
-                    .map(|record| {
-                        let mut bridge: BridgeDescriptor = bincode::deserialize(&record.descriptor)
-                            .expect("failed to deserialize bridge descriptor from database!");
-                        // If we are in legacy mode, and this is an obfsudp bridge, we encode the sosistab2 e2e key of the exit too
-                        //
-                        println!(
-                            "BRIDGE protocol contains udp: {}",
-                            bridge.protocol.contains("udp")
-                        );
 
-                        let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp")
-                        {
-                            bincode::serialize(&(bridge.cookie.clone(), exit_sosistab2_pk.clone()))
-                                .unwrap()
-                                .into()
-                        } else {
-                            bridge.cookie
-                        };
-                        bridge.cookie = cookie_or_tuple;
+        let mut txn = self.postgres.begin().await?;
+        let exit_sosistab2_pk: (Vec<u8>,) =
+            sqlx::query_as("select sosistab_key from exits where hostname = $1")
+                .bind(exit.as_str())
+                .fetch_one(&mut txn)
+                .await?;
 
-                        bridge
-                    })
-                    .collect();
-                self.bridge_per_exit_cache.insert(exit, result.clone());
-                result
-            }
-        };
+        let mut all_bridges: Vec<BridgeDescriptor> = self
+            .bridge_store
+            .get_bridges()
+            .iter()
+            .map(|bridge| {
+                let mut bridge = bridge.clone();
+                let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp") {
+                    bincode::serialize(&(bridge.cookie.clone(), exit_sosistab2_pk.clone()))
+                        .unwrap()
+                        .into()
+                } else {
+                    bridge.cookie
+                };
+                bridge.cookie = cookie_or_tuple;
+                bridge
+            })
+            .collect();
+
         let premium_routes = if let Some(routes) = self.premium_route_cache.get(&()) {
             routes
         } else {
