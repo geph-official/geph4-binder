@@ -33,6 +33,7 @@ use semver::{Version, VersionReq};
 use smol::Task;
 use smol_str::SmolStr;
 use smol_timeout::TimeoutExt;
+use sosistab2::MuxPublic;
 use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
@@ -546,7 +547,12 @@ impl BinderCoreV2 {
                 .bind(exit.as_str())
                 .fetch_one(&mut txn)
                 .await?;
-
+        let sosistab2_e2e_key = MuxPublic::from_bytes(
+            sosistab2_e2e_key
+                .0
+                .try_into()
+                .expect("e2e key is wrong length"),
+        );
         let mut all_bridges: Vec<BridgeDescriptor> = self
             .bridge_store
             .get_bridges()
@@ -555,7 +561,7 @@ impl BinderCoreV2 {
                 let mut bridge = bridge.clone();
                 // NOTE: handle legacy calls by encoding both the pipe-specific cookie and the e2e key
                 let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp") {
-                    bincode::serialize(&(bridge.cookie.clone(), sosistab2_e2e_key.clone()))
+                    bincode::serialize(&(bridge.cookie, sosistab2_e2e_key))
                         .unwrap()
                         .into()
                 } else {
