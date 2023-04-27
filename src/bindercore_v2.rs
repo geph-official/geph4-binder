@@ -723,9 +723,9 @@ impl BinderCoreV2 {
             .bind(user_info.userid)
             .fetch_one(&mut txn)
             .await?;
-        // if login_count > 30 {
-        //     return Ok(Err(AuthError::TooManyRequests));
-        // }
+        if login_count > 30 {
+            return Ok(Err(AuthError::TooManyRequests));
+        }
 
         txn.commit().await?;
 
