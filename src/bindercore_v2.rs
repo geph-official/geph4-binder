@@ -542,17 +542,13 @@ impl BinderCoreV2 {
         }
 
         let mut txn = self.postgres.begin().await?;
-        let sosistab2_e2e_key: (Vec<u8>,) =
+        let exit_record: ExitRecord =
             sqlx::query_as("select sosistab_key from exits where hostname = $1")
                 .bind(exit.as_str())
                 .fetch_one(&mut txn)
                 .await?;
-        let sosistab2_e2e_key = MuxPublic::from_bytes(
-            sosistab2_e2e_key
-                .0
-                .try_into()
-                .expect("e2e key is wrong length"),
-        );
+        let sosistab2_e2e_key = exit_record.sosistab_key;
+
         let mut all_bridges: Vec<BridgeDescriptor> = self
             .bridge_store
             .get_bridges(exit)
