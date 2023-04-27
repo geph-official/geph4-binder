@@ -557,6 +557,7 @@ impl BinderCoreV2 {
             .bridge_store
             .get_bridges()
             .iter()
+            .filter(|bridge| bridge.exit_hostname == exit)
             .map(|bridge| {
                 let mut bridge = bridge.clone();
                 // NOTE: handle legacy calls by encoding both the pipe-specific cookie and the e2e key
