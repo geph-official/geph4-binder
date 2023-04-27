@@ -24,8 +24,12 @@ impl BridgeStore {
 
     pub fn get_bridges(&self, exit_hostname: SmolStr) -> Vec<BridgeDescriptor> {
         self.store
-            .iter()
-            .map(|entry| entry.0.clone())
+            .clone()
+            .into_iter()
+            .map(|pair| {
+                let bridge_info = pair.1;
+                bridge_info.0
+            })
             .filter(|bridge| bridge.exit_hostname == exit_hostname)
             .collect()
     }
