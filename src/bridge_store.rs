@@ -22,8 +22,12 @@ impl BridgeStore {
         self.store.insert(id, (bridge.clone(), bridge.update_time));
     }
 
-    pub fn get_bridges(&self) -> Vec<BridgeDescriptor> {
-        self.store.iter().map(|entry| entry.0.clone()).collect()
+    pub fn get_bridges(&self, exit_hostname: SmolStr) -> Vec<BridgeDescriptor> {
+        self.store
+            .iter()
+            .map(|entry| entry.0.clone())
+            .filter(|bridge| bridge.exit_hostname == exit_hostname)
+            .collect()
     }
 
     pub fn delete_bridge(&self, bridge_id: &BridgeId) {

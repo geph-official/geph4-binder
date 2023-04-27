@@ -555,9 +555,8 @@ impl BinderCoreV2 {
         );
         let mut all_bridges: Vec<BridgeDescriptor> = self
             .bridge_store
-            .get_bridges()
+            .get_bridges(exit)
             .iter()
-            .filter(|bridge| bridge.exit_hostname == exit)
             .map(|bridge| {
                 let mut bridge = bridge.clone();
                 // NOTE: handle legacy calls by encoding both the pipe-specific cookie and the e2e key
