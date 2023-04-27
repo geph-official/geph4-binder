@@ -542,11 +542,10 @@ impl BinderCoreV2 {
         }
 
         let mut txn = self.postgres.begin().await?;
-        let exit_record: ExitRecord =
-            sqlx::query_as("select sosistab_key from exits where hostname = $1")
-                .bind(exit.as_str())
-                .fetch_one(&mut txn)
-                .await?;
+        let exit_record: ExitRecord = sqlx::query_as("select * from exits where hostname = $1")
+            .bind(exit.as_str())
+            .fetch_one(&mut txn)
+            .await?;
         let sosistab2_e2e_key = exit_record.sosistab_key;
 
         let mut all_bridges: Vec<BridgeDescriptor> = self
@@ -724,9 +723,9 @@ impl BinderCoreV2 {
             .bind(user_info.userid)
             .fetch_one(&mut txn)
             .await?;
-        if login_count > 30 {
-            return Ok(Err(AuthError::TooManyRequests));
-        }
+        // if login_count > 30 {
+        //     return Ok(Err(AuthError::TooManyRequests));
+        // }
 
         txn.commit().await?;
 
