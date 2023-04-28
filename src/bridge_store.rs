@@ -18,7 +18,7 @@ pub struct BridgeStore {
 
 impl BridgeStore {
     pub fn add_bridge(&self, bridge: &BridgeDescriptor) {
-        let id = (bridge.protocol.clone(), bridge.endpoint.clone());
+        let id = (bridge.protocol.clone(), bridge.endpoint);
         self.store.insert(id, (bridge.clone(), bridge.update_time));
     }
 
