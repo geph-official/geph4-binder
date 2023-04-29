@@ -552,11 +552,11 @@ impl BinderCoreV2 {
             .bridge_store
             .get_bridges(exit)
             .iter()
-            .map(|bridge| {
+            .filter_map(|bridge| {
                 let mut bridge = bridge.clone();
                 // NOTE: handle legacy calls by encoding both the pipe-specific cookie and the e2e key
                 let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp") {
-                    let cookie_bytes: [u8; 32] = bridge.cookie.as_ref().try_into().unwrap();
+                    let cookie_bytes: [u8; 32] = bridge.cookie.as_ref().try_into().ok()?;
                     let cookie = ObfsUdpPublic::from_bytes(cookie_bytes);
                     bincode::serialize(&(cookie, sosistab2_e2e_key))
                         .unwrap()
@@ -565,7 +565,7 @@ impl BinderCoreV2 {
                     bridge.cookie
                 };
                 bridge.cookie = cookie_or_tuple;
-                bridge
+                Some(bridge)
             })
             .collect();
 
