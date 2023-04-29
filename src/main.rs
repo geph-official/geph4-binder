@@ -1,8 +1,11 @@
 mod bindercore_v2;
+mod bridge_store;
+mod records;
 mod serve;
 
 use env_logger::Env;
 
+use log::LevelFilter;
 use mimalloc::MiMalloc;
 
 use rand::Rng;
@@ -29,12 +32,14 @@ pub struct Opt {
     #[structopt(default_value = "https://single-verve-156821.ew.r.appspot.com", long)]
     captcha_endpoint: String,
     /// NOT USED. Kept so that old systemd scripts do not fail with argument not found.
+    #[allow(unused)]
     #[structopt(default_value = "127.0.0.1:18080", long)]
     listen_http: SocketAddr,
     /// New HTTP listening port
     #[structopt(default_value = "0.0.0.0:28080", long)]
     listen_new: SocketAddr,
     /// NOT USED. Kept so that old systemd scripts do not fail with argument not found.
+    #[allow(unused)]
     #[structopt(long, default_value = "127.0.0.1:12345")]
     gfwreport_addr: SocketAddr,
     #[structopt(long, default_value = "172.105.28.221:8125")]
@@ -43,16 +48,23 @@ pub struct Opt {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Stress-tests load balancing as well as forcing upgrades.
-    std::thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_secs(
-            rand::thread_rng().gen_range(3600, 86400),
-        ));
-        std::process::exit(-1);
-    });
-
     smolscale::block_on(async {
-        env_logger::Builder::from_env(Env::default().default_filter_or("geph4_binder=info")).init();
+        env_logger::Builder::new()
+            .format(|buf, record| {
+                use std::io::Write;
+                writeln!(
+                    buf,
+                    "{}:{} {} [{}] - {}",
+                    record.file().unwrap_or("unknown"),
+                    record.line().unwrap_or(0),
+                    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
+                    record.level(),
+                    record.args()
+                )
+            })
+            .filter(Some("geph4_binder"), LevelFilter::Info)
+            .init();
+
         let opt = Opt::from_args();
 
         log::info!("geph4-binder starting with:");

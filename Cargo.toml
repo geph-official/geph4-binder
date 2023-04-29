@@ -51,7 +51,7 @@ jemallocator-global = "0.3.0"
 moka = "0.9.3"
 itertools = "0.10.3"
 
-geph4-protocol = { git = "https://github.com/geph-official/geph4-protocol", branch = "gibbername-exits" }
+geph4-protocol = "0.16"
  
 async-trait = "0.1.57"
 async-oneshot = "0.5.0"
@@ -77,6 +77,7 @@ melstructs = "0.3.2"
 melnet2 = "0.3.1"
 melbootstrap = "0.8.3"
 tmelcrypt = "0.2.7"
+sosistab2 = "0.8.16"
 
 [profile.release]
 panic = 'abort'
