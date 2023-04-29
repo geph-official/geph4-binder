@@ -542,10 +542,16 @@ impl BinderCoreV2 {
         }
 
         let mut txn = self.postgres.begin().await?;
-        let exit_record: ExitRecord = sqlx::query_as("select * from exits where hostname = $1")
-            .bind(exit.as_str())
-            .fetch_one(&mut txn)
-            .await?;
+        let exit_record: Option<ExitRecord> =
+            sqlx::query_as("select * from exits where hostname = $1")
+                .bind(exit.as_str())
+                .fetch_optional(&mut txn)
+                .await?;
+        let exit_record = if let Some(r) = exit_record {
+            r
+        } else {
+            return Ok(vec![]);
+        };
         let sosistab2_e2e_key = MuxPublic::from_bytes(exit_record.sosistab_key);
 
         let mut all_bridges: Vec<BridgeDescriptor> = self
@@ -873,8 +879,6 @@ impl BinderCoreV2 {
             }
         };
 
-        println!("get user info res: {:?}", res);
-
         let (userid,) = if let Some(res) = res {
             res
         } else {
@@ -904,10 +908,6 @@ async fn verify_captcha(
     captcha_id: &str,
     solution: &str,
 ) -> anyhow::Result<bool> {
-    println!(
-        "verify_captcha({}, {}, {})",
-        captcha_service, captcha_id, solution
-    );
     // call out to the microservice
     let resp = reqwest::get(&format!(
         "{}/solve?id={}&soln={}",
