@@ -48,14 +48,6 @@ pub struct Opt {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Stress-tests load balancing as well as forcing upgrades.
-    std::thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_secs(
-            rand::thread_rng().gen_range(3600, 86400),
-        ));
-        std::process::exit(-1);
-    });
-
     smolscale::block_on(async {
         env_logger::Builder::new()
             .format(|buf, record| {
