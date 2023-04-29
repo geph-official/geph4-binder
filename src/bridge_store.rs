@@ -35,7 +35,7 @@ impl BridgeStore {
     }
 
     pub fn delete_bridge(&self, bridge_id: &BridgeId) {
-        self.store.remove(&bridge_id);
+        self.store.remove(bridge_id);
     }
 
     pub fn delete_expired_bridges(&self, time_to_live_secs: u64) {

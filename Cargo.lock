@@ -2076,8 +2076,9 @@ dependencies = [
 
 [[package]]
 name = "geph4-protocol"
-version = "0.15.0"
-source = "git+https://github.com/geph-official/geph4-protocol?branch=gibbername-exits#6afec17e07aaf502a1cfcec2e9410e6853221f8e"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b17dc7e24b676957c71ef328c96fbd10fb44482f23408baecc99cbc1e6b2c091"
 dependencies = [
  "acidjson",
  "anyhow",
@@ -2183,7 +2184,8 @@ dependencies = [
 [[package]]
 name = "gibbername"
 version = "0.1.0"
-source = "git+https://github.com/mel-project/gibbername?branch=master#271b0a1152c166024ea9388a9194aac7e26c75ca"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff0c77f198230a8bbd5dc02b85d1259b0fae886dbb3ab3d3523bf22947a2e49b"
 dependencies = [
  "anyhow",
  "env_logger 0.10.0",
