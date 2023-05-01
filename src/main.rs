@@ -3,14 +3,10 @@ mod bridge_store;
 mod records;
 mod serve;
 
-use env_logger::Env;
-
 use log::LevelFilter;
 use mimalloc::MiMalloc;
 
-use rand::Rng;
-
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use structopt::StructOpt;
 
 use crate::serve::start_server;
