@@ -710,6 +710,16 @@ impl BinderCoreV2 {
             return Ok(Err(AuthError::InvalidCredentials));
         }
 
+        if user_info
+            .subscription
+            .as_ref()
+            .map(|s| s.level)
+            .unwrap_or(Level::Free)
+            != auth_req.level
+        {
+            return Ok(Err(AuthError::WrongLevel));
+        }
+
         let key = self.get_mizaru_sk(auth_req.level).await;
         let real_epoch = mizaru::time_to_epoch(SystemTime::now());
         if real_epoch.abs_diff(auth_req.epoch as usize) > 1 {
