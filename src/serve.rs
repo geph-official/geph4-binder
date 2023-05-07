@@ -90,6 +90,10 @@ impl BinderProtocol for BinderCoreWrapper {
         backoff(|| self.core_v2.authenticate_v2(&auth_req)).await
     }
 
+    async fn get_login_url(&self, credentials: Credentials) -> Result<String, AuthError> {
+        self.core_v2.get_login_url(credentials).await
+    }
+
     async fn validate(&self, token: BlindToken) -> bool {
         self.core_v2.validate(token.clone()).await
     }

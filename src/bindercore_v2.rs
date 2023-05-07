@@ -757,6 +757,28 @@ impl BinderCoreV2 {
         Ok(Ok(response))
     }
 
+    pub async fn get_login_url(
+        &self,
+        credentials: Credentials,
+    ) -> anyhow::Result<String, AuthError> {
+        match credentials {
+            Credentials::Password { username, password } => Ok(format!(
+                "https://geph.io/billing/login?next=%2Fbilling%2Fdashboard&uname={}&pwd={}",
+                username, password
+            )),
+            Credentials::Signature {
+                pubkey,
+                unix_secs,
+                signature,
+            } => {
+                Ok(format!(
+                "https://geph.io/billing/login?next=%2Fbilling%2Fdashboard&pkey={}&secs={}&sig={}",
+                pubkey, unix_secs, hex::encode(signature)
+            ))
+            }
+        }
+    }
+
     /// Validates a token
     pub async fn validate(&self, token: BlindToken) -> bool {
         let cache_key = blake3::hash(&bincode::serialize(&token).unwrap());
