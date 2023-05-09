@@ -14,7 +14,7 @@ use crate::serve::start_server;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-const POOL_SIZE: usize = 12;
+const POOL_SIZE: usize = 30;
 
 #[derive(Debug, StructOpt)]
 pub struct Opt {

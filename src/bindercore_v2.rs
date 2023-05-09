@@ -33,7 +33,7 @@ use semver::{Version, VersionReq};
 use smol::Task;
 use smol_str::SmolStr;
 use smol_timeout::TimeoutExt;
-use sosistab2::{MuxPublic, ObfsUdpPublic};
+use sosistab2::ObfsUdpPublic;
 use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
@@ -51,11 +51,11 @@ pub struct BinderCoreV2 {
     // caches the network summary
     summary_cache: Cache<(), MasterSummary>,
 
-    // caches the entire req/resp of authentications.
-    auth_cache: Cache<AuthRequest, AuthResponse>,
-
     // caches the entire req/resp of authentications for V2
     auth_cache_v2: Cache<AuthRequestV2, AuthResponseV2>,
+
+    // caches the user info
+    user_info_cache: Cache<Credentials, UserInfoV2>,
 
     // caches the per-epoch key
     epoch_key_cache: Cache<(Level, usize), rsa::RSAPublicKey>,
@@ -66,7 +66,6 @@ pub struct BinderCoreV2 {
     // in-memory store for bridge descriptors
     bridge_store: Arc<BridgeStore>,
 
-    // caches *wrong* passwords
     pwd_cache: Cache<(SmolStr, SmolStr), bool>,
 
     // caches the "premium routes"
@@ -97,7 +96,7 @@ impl BinderCoreV2 {
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
             .max_connections(POOL_SIZE as _)
-            .max_lifetime(Duration::from_secs(600))
+            .max_lifetime(Duration::from_secs(60))
             .connect_with(
                 PgConnectOptions::from_str(database_url)?
                     .ssl_mode(PgSslMode::VerifyFull)
@@ -139,11 +138,6 @@ impl BinderCoreV2 {
                 .time_to_live(Duration::from_secs(600))
                 .build(),
 
-            auth_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(3600))
-                .max_capacity(100000)
-                .build(),
-
             auth_cache_v2: Cache::builder()
                 .time_to_live(Duration::from_secs(3600))
                 .max_capacity(100000)
@@ -165,6 +159,10 @@ impl BinderCoreV2 {
 
             premium_route_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(120))
+                .build(),
+
+            user_info_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(60))
                 .build(),
 
             postgres,
@@ -368,20 +366,18 @@ impl BinderCoreV2 {
             return Ok(Err(AuthError::InvalidCredentials));
         }
 
-        let user_id = self
-            .get_user_info_v2(credentials.clone())
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?
-            .userid;
+        let user_id = self.get_user_info_v2(credentials.clone()).await?;
+        if let Some(user_id) = user_id {
+            let user_id = user_id.userid;
+            let mut txn = self.postgres.begin().await?;
+            sqlx::query("delete from users where id = $1")
+                .bind(user_id)
+                .execute(&mut txn)
+                .await?;
+            txn.commit().await?;
 
-        let mut txn = self.postgres.begin().await?;
-        sqlx::query("delete from users where id = $1")
-            .bind(user_id)
-            .execute(&mut txn)
-            .await?;
-        txn.commit().await?;
-
-        log::info!("successfully deleted user: {:?}", user_id);
+            log::info!("successfully deleted user: {:?}", user_id);
+        }
 
         Ok(Ok(()))
     }
@@ -541,18 +537,14 @@ impl BinderCoreV2 {
             return Ok(vec![]);
         }
 
-        let mut txn = self.postgres.begin().await?;
-        let exit_record: Option<ExitRecord> =
-            sqlx::query_as("select * from exits where hostname = $1")
-                .bind(exit.as_str())
-                .fetch_optional(&mut txn)
-                .await?;
+        let summary = self.get_summary().await?;
+        let exit_record = summary.exits.iter().find(|e| e.hostname == exit);
         let exit_record = if let Some(r) = exit_record {
             r
         } else {
             return Ok(vec![]);
         };
-        let sosistab2_e2e_key = MuxPublic::from_bytes(exit_record.sosistab_key);
+        let sosistab2_e2e_key = exit_record.sosistab_e2e_pk;
 
         let mut all_bridges: Vec<BridgeDescriptor> = self
             .bridge_store
@@ -628,66 +620,30 @@ impl BinderCoreV2 {
         &self,
         auth_req: &AuthRequest,
     ) -> anyhow::Result<Result<AuthResponse, AuthError>> {
-        if let Some(val) = self.auth_cache.get(auth_req) {
-            return Ok(Ok(val));
-        }
-
-        let user_info = if let Some(user_info) = self.get_user_info_v1(&auth_req.username).await? {
-            user_info
-        } else {
-            return Ok(Err(AuthError::InvalidCredentials));
+        let v2_request = AuthRequestV2 {
+            credentials: Credentials::Password {
+                username: auth_req.username.clone(),
+                password: auth_req.password.clone(),
+            },
+            level: auth_req.level,
+            epoch: auth_req.epoch,
+            blinded_digest: auth_req.blinded_digest.clone(),
         };
-
-        if user_info
-            .subscription
-            .as_ref()
-            .map(|s| s.level)
-            .unwrap_or(Level::Free)
-            != auth_req.level
-        {
-            return Ok(Err(AuthError::WrongLevel));
+        let v2_response = self.authenticate_v2(&v2_request).await?;
+        match v2_response {
+            Err(err) => Ok(Err(err)),
+            Ok(resp) => {
+                let response = AuthResponse {
+                    user_info: UserInfo {
+                        userid: resp.user_info.userid,
+                        username: auth_req.username.clone(),
+                        subscription: resp.user_info.subscription.clone(),
+                    },
+                    blind_signature_bincode: resp.blind_signature_bincode,
+                };
+                Ok(Ok(response))
+            }
         }
-
-        if !self
-            .verify_password(&auth_req.username, &auth_req.password)
-            .await?
-        {
-            return Ok(Err(AuthError::InvalidCredentials));
-        }
-        let key = self.get_mizaru_sk(auth_req.level).await;
-        let real_epoch = mizaru::time_to_epoch(SystemTime::now());
-        if real_epoch.abs_diff(auth_req.epoch as usize) > 1 {
-            return Ok(Err(AuthError::Other("time way too out of sync".into())));
-        }
-
-        // TODO rate limiting
-
-        let mut txn = self.postgres.begin().await?;
-        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
-            .bind(user_info.userid)
-            .bind(Utc::now().naive_utc())
-            .execute(&mut txn)
-            .await?;
-
-        let (login_count,): (i64,) = sqlx::query_as(
-                "select count (*) from (select distinct last_login from auth_logs where id = $1 and last_login + '1 day' > NOW()) as temp",
-            )
-            .bind(user_info.userid)
-            .fetch_one(&mut txn)
-            .await?;
-        if login_count > 30 {
-            return Ok(Err(AuthError::TooManyRequests));
-        }
-
-        txn.commit().await?;
-
-        let sig = key.blind_sign(auth_req.epoch as usize, &auth_req.blinded_digest);
-        let response = AuthResponse {
-            user_info,
-            blind_signature_bincode: bincode::serialize(&sig).unwrap().into(),
-        };
-        self.auth_cache.insert(auth_req.clone(), response.clone());
-        Ok(Ok(response))
     }
 
     pub async fn authenticate_v2(
@@ -835,43 +791,15 @@ impl BinderCoreV2 {
         }
     }
 
-    /// Obtain the user info given the username.
-    async fn get_user_info_v1(&self, username: &str) -> Result<Option<UserInfo>, sqlx::Error> {
-        let mut txn = self.postgres.begin().await?;
-        let res: Option<(i32, String, String)> =
-            sqlx::query_as("select id,username,pwdhash from users_legacy where username = $1")
-                .bind(username)
-                .fetch_optional(&mut txn)
-                .await?;
-        let (userid, username, _) = if let Some(res) = res {
-            res
-        } else {
-            return Ok(None);
-        };
-        let plan_row: Option<(String, f64)> = sqlx::query_as(
-            "select plan, extract(epoch from expires) from subscriptions where id = $1",
-        )
-        .bind(userid)
-        .fetch_optional(&mut txn)
-        .await?;
-
-        Ok(Some(UserInfo {
-            userid,
-            username: username.into(),
-
-            subscription: plan_row.map(|row| SubscriptionInfo {
-                level: Level::Plus,
-                expires_unix: row.1 as i64,
-            }),
-        }))
-    }
-
     async fn get_user_info_v2(
         &self,
         credentials: Credentials,
     ) -> Result<Option<UserInfoV2>, sqlx::Error> {
+        if let Some(val) = self.user_info_cache.get(&credentials) {
+            return Ok(Some(val));
+        }
         let mut txn = self.postgres.begin().await?;
-        let res: Option<(i32,)> = match credentials {
+        let res: Option<(i32,)> = match &credentials {
             Credentials::Password {
                 username,
                 password: _,
@@ -901,14 +829,15 @@ impl BinderCoreV2 {
         .bind(userid)
         .fetch_optional(&mut txn)
         .await?;
-
-        Ok(Some(UserInfoV2 {
+        let response = UserInfoV2 {
             userid,
             subscription: plan_row.map(|row| SubscriptionInfo {
                 level: Level::Plus,
                 expires_unix: row.1 as i64,
             }),
-        }))
+        };
+        self.user_info_cache.insert(credentials, response.clone());
+        Ok(Some(response))
     }
 }
 
