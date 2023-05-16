@@ -287,6 +287,20 @@ impl BinderCoreV2 {
             return Ok(Err(RegisterError::Other("incorrect captcha".into())));
         }
 
+        if let Credentials::Signature {
+            pubkey,
+            unix_secs,
+            signature,
+        } = credentials.clone()
+        {
+            if !verify_pk_auth(pubkey, unix_secs, &signature) {
+                log::debug!("Credentials for {} were not able to be verified", pubkey);
+                return Ok(Err(RegisterError::Other(
+                    "Invalid keypair credentials".into(),
+                )));
+            }
+        }
+
         // // TODO atomicity
         if self.get_user_info_v2(credentials.clone()).await?.is_some() {
             return Ok(Err(RegisterError::DuplicateCredentials));
