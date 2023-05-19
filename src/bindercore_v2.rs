@@ -874,7 +874,7 @@ impl BinderCoreV2 {
             }
             Credentials::Signature { pubkey, .. } => {
                 sqlx::query_as("select user_id from auth_pubkey where pubkey = $1")
-                    .bind(String::from("\\x") + &pubkey.to_string())
+                    .bind(pubkey.0)
                     .fetch_optional(&mut txn)
                     .await?
             }
