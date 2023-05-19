@@ -1,16 +1,16 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString},
     str::FromStr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 use async_compat::CompatExt;
 use bytes::Bytes;
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::{lock::RwLock, DashMap};
 use futures_util::{future::Shared, FutureExt};
 
 use geph4_protocol::{
@@ -24,6 +24,7 @@ use geph4_protocol::{
 use itertools::Itertools;
 
 use moka::sync::Cache;
+
 use once_cell::sync::Lazy;
 
 use rand::{distributions::Alphanumeric, Rng};
@@ -33,7 +34,7 @@ use semver::{Version, VersionReq};
 use smol::Task;
 use smol_str::SmolStr;
 use smol_timeout::TimeoutExt;
-use sosistab2::{MuxPublic, ObfsUdpPublic};
+use sosistab2::ObfsUdpPublic;
 use sqlx::{
     pool::PoolOptions,
     postgres::{PgConnectOptions, PgSslMode},
@@ -41,7 +42,7 @@ use sqlx::{
 };
 use tap::Tap;
 
-use crate::{bridge_store::BridgeStore, records::ExitRecord, POOL_SIZE};
+use crate::{bridge_store::BridgeStore, records::ExitRecord, run_blocking, POOL_SIZE};
 
 pub struct BinderCoreV2 {
     captcha_service_url: SmolStr,
@@ -51,11 +52,8 @@ pub struct BinderCoreV2 {
     // caches the network summary
     summary_cache: Cache<(), MasterSummary>,
 
-    // caches the entire req/resp of authentications.
-    auth_cache: Cache<AuthRequest, AuthResponse>,
-
-    // caches the entire req/resp of authentications for V2
-    auth_cache_v2: Cache<AuthRequestV2, AuthResponseV2>,
+    // caches the user info
+    user_id_cache: Cache<Credentials, i32>,
 
     // caches the per-epoch key
     epoch_key_cache: Cache<(Level, usize), rsa::RSAPublicKey>,
@@ -66,7 +64,6 @@ pub struct BinderCoreV2 {
     // in-memory store for bridge descriptors
     bridge_store: Arc<BridgeStore>,
 
-    // caches *wrong* passwords
     pwd_cache: Cache<(SmolStr, SmolStr), bool>,
 
     // caches the "premium routes"
@@ -77,6 +74,9 @@ pub struct BinderCoreV2 {
     announcements_cache: Cache<(), String>,
 
     validate_cache: Cache<blake3::Hash, bool>,
+
+    // cached list of subscriptions
+    cached_subscriptions: Arc<RwLock<HashMap<i32, SubscriptionInfo>>>,
 
     // Postgres
     postgres: PgPool,
@@ -97,7 +97,8 @@ impl BinderCoreV2 {
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
             .max_connections(POOL_SIZE as _)
-            .max_lifetime(Duration::from_secs(600))
+            .acquire_timeout(Duration::from_secs(1))
+            .max_lifetime(Duration::from_secs(60))
             .connect_with(
                 PgConnectOptions::from_str(database_url)?
                     .ssl_mode(PgSslMode::VerifyFull)
@@ -106,17 +107,46 @@ impl BinderCoreV2 {
             .await?;
 
         let bridge_store = Arc::new(BridgeStore::default());
+        let cached_subscriptions = Arc::new(RwLock::new(HashMap::new()));
 
         let _task = {
             let postgres = postgres.clone();
             let statsd_client = statsd_client.clone();
             let bridge_store = bridge_store.clone();
+            let cached_subscriptions = cached_subscriptions.clone();
             smolscale::spawn(async move {
+                let postgres2 = postgres.clone();
+                let _task = smolscale::spawn(async move {
+                    loop {
+                        let rows: Result<Vec<(i32, String, f64)>, _> = sqlx::query_as(
+                            "select id,plan,extract(epoch from expires) from subscriptions",
+                        )
+                        .fetch_all(&postgres2)
+                        .await;
+                        if let Ok(rows) = rows {
+                            let mapping = rows
+                                .into_iter()
+                                .map(|row| {
+                                    (
+                                        row.0,
+                                        SubscriptionInfo {
+                                            level: Level::Plus,
+                                            expires_unix: row.2 as _,
+                                        },
+                                    )
+                                })
+                                .collect();
+                            *cached_subscriptions.write() = mapping;
+                        }
+                        smol::Timer::after(Duration::from_secs(fastrand::u64(0..60))).await;
+                    }
+                });
+
                 loop {
-                    smol::Timer::after(Duration::from_secs(fastrand::u64(0..600))).await;
+                    smol::Timer::after(Duration::from_secs(fastrand::u64(0..120))).await;
 
                     // clean up old bridges
-                    bridge_store.delete_expired_bridges(180);
+                    bridge_store.delete_expired_bridges(200);
 
                     let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
                     .fetch_one(& postgres)
@@ -139,16 +169,6 @@ impl BinderCoreV2 {
                 .time_to_live(Duration::from_secs(600))
                 .build(),
 
-            auth_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(3600))
-                .max_capacity(100000)
-                .build(),
-
-            auth_cache_v2: Cache::builder()
-                .time_to_live(Duration::from_secs(3600))
-                .max_capacity(100000)
-                .build(),
-
             epoch_key_cache: Cache::new(10000),
 
             bridge_per_key: Cache::builder()
@@ -158,6 +178,7 @@ impl BinderCoreV2 {
             bridge_store,
 
             bridge_secret_cache: Cache::new(100),
+            cached_subscriptions,
 
             announcements_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(10))
@@ -166,6 +187,8 @@ impl BinderCoreV2 {
             premium_route_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(120))
                 .build(),
+
+            user_id_cache: Cache::builder().max_capacity(100000).build(),
 
             postgres,
 
@@ -223,7 +246,7 @@ impl BinderCoreV2 {
                     match row {
                         Some(row) => {
                             let res: mizaru::SecretKey =
-                                smol::unblock(move || bincode::deserialize(&row.0))
+                                run_blocking(move || bincode::deserialize(&row.0))
                                     .await
                                     .expect("must deserialize mizaru-master-sk");
                             let _ =
@@ -382,20 +405,18 @@ impl BinderCoreV2 {
             return Ok(Err(AuthError::InvalidCredentials));
         }
 
-        let user_id = self
-            .get_user_info_v2(credentials.clone())
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?
-            .userid;
+        let user_id = self.get_user_info_v2(credentials.clone()).await?;
+        if let Some(user_id) = user_id {
+            let user_id = user_id.userid;
+            let mut txn = self.postgres.begin().await?;
+            sqlx::query("delete from users where id = $1")
+                .bind(user_id)
+                .execute(&mut txn)
+                .await?;
+            txn.commit().await?;
 
-        let mut txn = self.postgres.begin().await?;
-        sqlx::query("delete from users where id = $1")
-            .bind(user_id)
-            .execute(&mut txn)
-            .await?;
-        txn.commit().await?;
-
-        log::info!("successfully deleted user: {:?}", user_id);
+            log::info!("successfully deleted user: {:?}", user_id);
+        }
 
         Ok(Ok(()))
     }
@@ -555,18 +576,14 @@ impl BinderCoreV2 {
             return Ok(vec![]);
         }
 
-        let mut txn = self.postgres.begin().await?;
-        let exit_record: Option<ExitRecord> =
-            sqlx::query_as("select * from exits where hostname = $1")
-                .bind(exit.as_str())
-                .fetch_optional(&mut txn)
-                .await?;
+        let summary = self.get_summary().await?;
+        let exit_record = summary.exits.iter().find(|e| e.hostname == exit);
         let exit_record = if let Some(r) = exit_record {
             r
         } else {
             return Ok(vec![]);
         };
-        let sosistab2_e2e_key = MuxPublic::from_bytes(exit_record.sosistab_key);
+        let sosistab2_e2e_key = exit_record.sosistab_e2e_pk;
 
         let mut all_bridges: Vec<BridgeDescriptor> = self
             .bridge_store
@@ -642,76 +659,36 @@ impl BinderCoreV2 {
         &self,
         auth_req: &AuthRequest,
     ) -> anyhow::Result<Result<AuthResponse, AuthError>> {
-        if let Some(val) = self.auth_cache.get(auth_req) {
-            return Ok(Ok(val));
-        }
-
-        let user_info = if let Some(user_info) = self.get_user_info_v1(&auth_req.username).await? {
-            user_info
-        } else {
-            return Ok(Err(AuthError::InvalidCredentials));
+        let v2_request = AuthRequestV2 {
+            credentials: Credentials::Password {
+                username: auth_req.username.clone(),
+                password: auth_req.password.clone(),
+            },
+            level: auth_req.level,
+            epoch: auth_req.epoch,
+            blinded_digest: auth_req.blinded_digest.clone(),
         };
-
-        if user_info
-            .subscription
-            .as_ref()
-            .map(|s| s.level)
-            .unwrap_or(Level::Free)
-            != auth_req.level
-        {
-            return Ok(Err(AuthError::WrongLevel));
+        let v2_response = self.authenticate_v2(&v2_request).await?;
+        match v2_response {
+            Err(err) => Ok(Err(err)),
+            Ok(resp) => {
+                let response = AuthResponse {
+                    user_info: UserInfo {
+                        userid: resp.user_info.userid,
+                        username: auth_req.username.clone(),
+                        subscription: resp.user_info.subscription.clone(),
+                    },
+                    blind_signature_bincode: resp.blind_signature_bincode,
+                };
+                Ok(Ok(response))
+            }
         }
-
-        if !self
-            .verify_password(&auth_req.username, &auth_req.password)
-            .await?
-        {
-            return Ok(Err(AuthError::InvalidCredentials));
-        }
-        let key = self.get_mizaru_sk(auth_req.level).await;
-        let real_epoch = mizaru::time_to_epoch(SystemTime::now());
-        if real_epoch.abs_diff(auth_req.epoch as usize) > 1 {
-            return Ok(Err(AuthError::Other("time way too out of sync".into())));
-        }
-
-        // TODO rate limiting
-
-        let mut txn = self.postgres.begin().await?;
-        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
-            .bind(user_info.userid)
-            .bind(Utc::now().naive_utc())
-            .execute(&mut txn)
-            .await?;
-
-        let (login_count,): (i64,) = sqlx::query_as(
-                "select count (*) from (select distinct last_login from auth_logs where id = $1 and last_login + '1 day' > NOW()) as temp",
-            )
-            .bind(user_info.userid)
-            .fetch_one(&mut txn)
-            .await?;
-        if login_count > 30 {
-            return Ok(Err(AuthError::TooManyRequests));
-        }
-
-        txn.commit().await?;
-
-        let sig = key.blind_sign(auth_req.epoch as usize, &auth_req.blinded_digest);
-        let response = AuthResponse {
-            user_info,
-            blind_signature_bincode: bincode::serialize(&sig).unwrap().into(),
-        };
-        self.auth_cache.insert(auth_req.clone(), response.clone());
-        Ok(Ok(response))
     }
 
     pub async fn authenticate_v2(
         &self,
         auth_req: &AuthRequestV2,
     ) -> anyhow::Result<Result<AuthResponseV2, AuthError>> {
-        if let Some(val) = self.auth_cache_v2.get(auth_req) {
-            return Ok(Ok(val));
-        }
-
         let user_info =
             if let Some(user_info) = self.get_user_info_v2(auth_req.credentials.clone()).await? {
                 user_info
@@ -733,7 +710,7 @@ impl BinderCoreV2 {
         {
             return Ok(Err(AuthError::WrongLevel));
         }
-
+        let start = Instant::now();
         let key = self.get_mizaru_sk(auth_req.level).await;
         let real_epoch = mizaru::time_to_epoch(SystemTime::now());
         if real_epoch.abs_diff(auth_req.epoch as usize) > 1 {
@@ -742,32 +719,37 @@ impl BinderCoreV2 {
 
         // TODO rate limiting
 
-        let mut txn = self.postgres.begin().await?;
-        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
-            .bind(user_info.userid)
-            .bind(Utc::now().naive_utc())
-            .execute(&mut txn)
-            .await?;
+        // let mut txn = self.postgres.begin().await?;
+        // sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
+        //     .bind(user_info.userid)
+        //     .bind(Utc::now().naive_utc())
+        //     .execute(&mut txn)
+        //     .await?;
 
-        let (login_count,): (i64,) = sqlx::query_as(
-                "select count (*) from (select distinct last_login from auth_logs where id = $1 and last_login + '1 day' > NOW()) as temp",
-            )
-            .bind(user_info.userid)
-            .fetch_one(&mut txn)
-            .await?;
-        if login_count > 30 {
-            return Ok(Err(AuthError::TooManyRequests));
-        }
+        // let (login_count,): (i64,) = sqlx::query_as(
+        //         "select count (*) from (select distinct last_login from auth_logs where id = $1 and last_login + '1 day' > NOW()) as temp",
+        //     )
+        //     .bind(user_info.userid)
+        //     .fetch_one(&mut txn)
+        //     .await?;
+        // if login_count > 30 {
+        //     return Ok(Err(AuthError::TooManyRequests));
+        // }
 
-        txn.commit().await?;
+        // txn.commit().await?;
+        let req = auth_req.clone();
+        let response = run_blocking(move || {
+            let sig = key.blind_sign(req.epoch as usize, &req.blinded_digest);
+            let response = AuthResponseV2 {
+                user_info,
+                blind_signature_bincode: bincode::serialize(&sig).unwrap().into(),
+            };
 
-        let sig = key.blind_sign(auth_req.epoch as usize, &auth_req.blinded_digest);
-        let response = AuthResponseV2 {
-            user_info,
-            blind_signature_bincode: bincode::serialize(&sig).unwrap().into(),
-        };
-        self.auth_cache_v2
-            .insert(auth_req.clone(), response.clone());
+            response
+        })
+        .await;
+        log::info!("blind_sign took {:?}", start.elapsed());
+
         Ok(Ok(response))
     }
 
@@ -829,8 +811,10 @@ impl BinderCoreV2 {
     /// Verifies the password.
     async fn verify_password(&self, username: &str, password: &str) -> anyhow::Result<bool> {
         if let Some(val) = self.pwd_cache.get(&(username.into(), password.into())) {
+            log::info!("HIT for username {username}");
             return Ok(val);
         }
+        log::info!("MISS for username {username}");
         let mut txn = self.postgres.begin().await?;
         let (pwdhash,): (String,) = if let Some(v) =
             sqlx::query_as("select pwdhash from auth_password where username = $1")
@@ -863,7 +847,8 @@ impl BinderCoreV2 {
                 let resp = reqwest::get("https://rsshub.app/telegram/channel/gephannounce").await?;
                 let bts = resp.bytes().await?;
                 anyhow::Ok(String::from_utf8_lossy(&bts).to_string())
-            };
+            }
+            .compat();
             if let Ok(val) = fallible.await {
                 self.announcements_cache.insert((), val.clone());
                 return val;
@@ -871,43 +856,13 @@ impl BinderCoreV2 {
         }
     }
 
-    /// Obtain the user info given the username.
-    async fn get_user_info_v1(&self, username: &str) -> Result<Option<UserInfo>, sqlx::Error> {
+    async fn get_user_id(&self, credentials: &Credentials) -> Result<Option<i32>, sqlx::Error> {
+        if let Some(val) = self.user_id_cache.get(credentials) {
+            log::info!("HIT for user id {val}");
+            return Ok(Some(val));
+        }
         let mut txn = self.postgres.begin().await?;
-        let res: Option<(i32, String, String)> =
-            sqlx::query_as("select id,username,pwdhash from users_legacy where username = $1")
-                .bind(username)
-                .fetch_optional(&mut txn)
-                .await?;
-        let (userid, username, _) = if let Some(res) = res {
-            res
-        } else {
-            return Ok(None);
-        };
-        let plan_row: Option<(String, f64)> = sqlx::query_as(
-            "select plan, extract(epoch from expires) from subscriptions where id = $1",
-        )
-        .bind(userid)
-        .fetch_optional(&mut txn)
-        .await?;
-
-        Ok(Some(UserInfo {
-            userid,
-            username: username.into(),
-
-            subscription: plan_row.map(|row| SubscriptionInfo {
-                level: Level::Plus,
-                expires_unix: row.1 as i64,
-            }),
-        }))
-    }
-
-    async fn get_user_info_v2(
-        &self,
-        credentials: Credentials,
-    ) -> Result<Option<UserInfoV2>, sqlx::Error> {
-        let mut txn = self.postgres.begin().await?;
-        let res: Option<(i32,)> = match credentials {
+        let id: Option<(i32,)> = match &credentials {
             Credentials::Password {
                 username,
                 password: _,
@@ -924,27 +879,32 @@ impl BinderCoreV2 {
                     .await?
             }
         };
+        txn.commit().await?;
+        if let Some(id) = id {
+            log::info!("MISS for user id {}", id.0);
+            self.user_id_cache.insert(credentials.clone(), id.0);
+            Ok(Some(id.0))
+        } else {
+            Ok(None)
+        }
+    }
 
-        let (userid,) = if let Some(res) = res {
-            res
+    async fn get_user_info_v2(
+        &self,
+        credentials: Credentials,
+    ) -> Result<Option<UserInfoV2>, sqlx::Error> {
+        let userid = if let Some(u) = self.get_user_id(&credentials).await? {
+            u
         } else {
             return Ok(None);
         };
+        let sub_info = self.cached_subscriptions.read().get(&userid).cloned();
 
-        let plan_row: Option<(String, f64)> = sqlx::query_as(
-            "select plan, extract(epoch from expires) from subscriptions where id = $1",
-        )
-        .bind(userid)
-        .fetch_optional(&mut txn)
-        .await?;
-
-        Ok(Some(UserInfoV2 {
+        let response = UserInfoV2 {
             userid,
-            subscription: plan_row.map(|row| SubscriptionInfo {
-                level: Level::Plus,
-                expires_unix: row.1 as i64,
-            }),
-        }))
+            subscription: sub_info,
+        };
+        Ok(Some(response))
     }
 }
 
@@ -968,7 +928,9 @@ async fn verify_captcha(
 /// Generate a captcha, returning its ID.
 async fn generate_captcha(captcha_service: &str) -> anyhow::Result<SmolStr> {
     // call out to the microservice
-    let resp = reqwest::get(&format!("{}/new", captcha_service)).await?;
+    let resp = reqwest::get(&format!("{}/new", captcha_service))
+        .compat()
+        .await?;
     if resp.status() == StatusCode::OK {
         Ok(String::from_utf8_lossy(&resp.bytes().await?).into())
     } else {
@@ -979,7 +941,9 @@ async fn generate_captcha(captcha_service: &str) -> anyhow::Result<SmolStr> {
 /// Render a captcha as PNG given a captcha service string.
 async fn render_captcha_png(captcha_service: &str, captcha_id: &str) -> anyhow::Result<Bytes> {
     // download the captcha from the service
-    let resp = reqwest::get(&format!("{}/img/{}", captcha_service, captcha_id)).await?;
+    let resp = reqwest::get(&format!("{}/img/{}", captcha_service, captcha_id))
+        .compat()
+        .await?;
     if resp.status() == StatusCode::OK {
         Ok(resp.bytes().await?)
     } else {
@@ -1021,15 +985,4 @@ async fn hash_libsodium_password(password: &str) -> String {
         cstr.to_str().unwrap().to_owned()
     })
     .await
-}
-
-async fn run_blocking<T: Send + Sync + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    static POOL: Lazy<ThreadPool> =
-        Lazy::new(|| ThreadPool::new(1, num_cpus::get(), Duration::from_secs(10)));
-    let (mut send, recv) = async_oneshot::oneshot();
-    POOL.execute(move || {
-        let t = f();
-        let _ = send.send(t);
-    });
-    recv.await.unwrap()
 }

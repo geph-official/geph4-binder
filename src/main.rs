@@ -5,8 +5,10 @@ mod serve;
 
 use log::LevelFilter;
 use mimalloc::MiMalloc;
+use once_cell::sync::Lazy;
+use rusty_pool::ThreadPool;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
 
 use crate::serve::start_server;
@@ -14,7 +16,7 @@ use crate::serve::start_server;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-const POOL_SIZE: usize = 12;
+const POOL_SIZE: usize = 30;
 
 #[derive(Debug, StructOpt)]
 pub struct Opt {
@@ -81,4 +83,15 @@ fn main() -> anyhow::Result<()> {
 
         Ok(())
     })
+}
+
+async fn run_blocking<T: Send + Sync + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    static POOL: Lazy<ThreadPool> =
+        Lazy::new(|| ThreadPool::new(1, num_cpus::get(), Duration::from_secs(10)));
+    let (mut send, recv) = async_oneshot::oneshot();
+    POOL.execute(move || {
+        let t = f();
+        let _ = send.send(t);
+    });
+    recv.await.unwrap()
 }

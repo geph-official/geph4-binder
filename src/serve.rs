@@ -16,6 +16,7 @@ use geph4_protocol::binder::protocol::{
     MasterSummary, MiscFatalError, RegisterError, RpcError,
 };
 use melnet2::{wire::http::HttpBackhaul, Backhaul};
+use moka::sync::Cache;
 use nanorpc::{DynRpcTransport, JrpcRequest, JrpcResponse, RpcService, RpcTransport};
 use once_cell::sync::Lazy;
 use smol_str::SmolStr;
@@ -29,6 +30,10 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
     log::info!("NEW HTTP listening on {}", opt.listen_new);
     let bcw = BinderCoreWrapper {
         core_v2: Arc::new(core_v2),
+        melnode_cache: Cache::builder()
+            .time_to_live(Duration::from_secs(5))
+            .build()
+            .into(),
     };
     let bcw = Arc::new(BinderService(bcw.clone()));
     let statsd_client = statsd_client.clone();
@@ -40,7 +45,7 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
             let bcw = bcw.clone();
             let statsd_client = statsd_client.clone();
             async move {
-                let fallible = async {
+                let fallible = smolscale::spawn(async move {
                     let (decrypted, their_pk) = box_decrypt(&s, my_sk.clone())?;
                     let start = Instant::now();
                     let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
@@ -62,7 +67,7 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                     let resp = serde_json::to_vec(&resp)?;
                     let resp = box_encrypt(&resp, my_sk, their_pk);
                     anyhow::Ok(resp)
-                };
+                });
                 if let Ok(res) = fallible.await {
                     res.to_vec()
                 } else {
@@ -78,6 +83,7 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
 #[derive(Clone)]
 struct BinderCoreWrapper {
     core_v2: Arc<BinderCoreV2>,
+    melnode_cache: Arc<Cache<Vec<u8>, JrpcResponse>>,
 }
 
 #[async_trait]
@@ -185,6 +191,12 @@ impl BinderProtocol for BinderCoreWrapper {
 
     /// Reverse proxies requests to melnode
     async fn reverse_proxy_melnode(&self, req: JrpcRequest) -> Result<JrpcResponse, RpcError> {
+        let cache_key = bincode::serialize(&(&req.method, &req.params)).unwrap();
+        if let Some(mut cached) = self.melnode_cache.get(&cache_key) {
+            cached.id = req.id;
+            return Ok(cached);
+        }
+
         // find a melnode and connect to it
         let bootstrap_routes = melbootstrap::bootstrap_routes(melstructs::NetID::Mainnet);
         let route = *bootstrap_routes
@@ -204,6 +216,7 @@ impl BinderProtocol for BinderCoreWrapper {
             .call_raw(req)
             .await
             .map_err(|_| RpcError::CommFailed)?;
+        self.melnode_cache.insert(cache_key, resp.clone());
         Ok(resp)
     }
 }
