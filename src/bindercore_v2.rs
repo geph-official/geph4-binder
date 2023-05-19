@@ -143,10 +143,10 @@ impl BinderCoreV2 {
                 });
 
                 loop {
-                    smol::Timer::after(Duration::from_secs(fastrand::u64(0..600))).await;
+                    smol::Timer::after(Duration::from_secs(fastrand::u64(0..120))).await;
 
                     // clean up old bridges
-                    bridge_store.delete_expired_bridges(600);
+                    bridge_store.delete_expired_bridges(200);
 
                     let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
                     .fetch_one(& postgres)
