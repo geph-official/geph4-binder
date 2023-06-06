@@ -25,11 +25,8 @@ use itertools::Itertools;
 
 use moka::sync::Cache;
 
-use once_cell::sync::Lazy;
-
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::StatusCode;
-use rusty_pool::ThreadPool;
 use semver::{Version, VersionReq};
 use smol::Task;
 use smol_str::SmolStr;
@@ -719,12 +716,12 @@ impl BinderCoreV2 {
 
         // TODO rate limiting
 
-        // let mut txn = self.postgres.begin().await?;
-        // sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
-        //     .bind(user_info.userid)
-        //     .bind(Utc::now().naive_utc())
-        //     .execute(&mut txn)
-        //     .await?;
+        let mut txn = self.postgres.begin().await?;
+        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
+            .bind(user_info.userid)
+            .bind(Utc::now().naive_utc())
+            .execute(&mut txn)
+            .await?;
 
         // let (login_count,): (i64,) = sqlx::query_as(
         //         "select count (*) from (select distinct last_login from auth_logs where id = $1 and last_login + '1 day' > NOW()) as temp",
@@ -736,7 +733,8 @@ impl BinderCoreV2 {
         //     return Ok(Err(AuthError::TooManyRequests));
         // }
 
-        // txn.commit().await?;
+        txn.commit().await?;
+
         let req = auth_req.clone();
         let response = run_blocking(move || {
             let sig = key.blind_sign(req.epoch as usize, &req.blinded_digest);
