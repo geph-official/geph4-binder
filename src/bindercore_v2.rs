@@ -862,11 +862,33 @@ impl BinderCoreV2 {
         } else {
             return Ok(None);
         };
-        let sub_info = self.cached_subscriptions.read().get(&userid).cloned();
+        let subscription =
+            if let Some(sub_info) = self.cached_subscriptions.read().get(&userid).cloned() {
+                Some(sub_info)
+            } else {
+                let mut txn = self.postgres.begin().await?;
+                let row: Option<(String, f64)> = sqlx::query_as(
+                    "select plan, extract(epoch from expires) from subscriptions where id = $1",
+                )
+                .bind(userid)
+                .fetch_optional(&mut txn)
+                .await?;
+
+                if let Some((_, expires_unix)) = row {
+                    let sub_info = SubscriptionInfo {
+                        level: Level::Plus,
+                        expires_unix: expires_unix as _,
+                    };
+
+                    Some(sub_info)
+                } else {
+                    None
+                }
+            };
 
         let response = UserInfoV2 {
             userid,
-            subscription: sub_info,
+            subscription,
         };
         Ok(Some(response))
     }
