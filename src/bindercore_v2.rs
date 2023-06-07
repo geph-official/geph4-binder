@@ -135,7 +135,7 @@ impl BinderCoreV2 {
                                 .collect();
                             *cached_subscriptions.write() = mapping;
                         }
-                        smol::Timer::after(Duration::from_secs(fastrand::u64(0..60))).await;
+                        smol::Timer::after(Duration::from_secs(fastrand::u64(0..5))).await;
                     }
                 });
 
