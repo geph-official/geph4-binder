@@ -24,6 +24,10 @@ use warp::Filter;
 
 use crate::{bindercore_v2::BinderCoreV2, Opt};
 
+const MAX_DATA_SIZE: usize = 2048;
+static LOTTERY_THRESHOLD: u64 = 9223372036854775808; // this threshold excludes ~50% of hashes
+const METRIC_KEY: &[u8; 32] = b"metric-data---------------------";
+
 pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()> {
     let my_sk = core_v2.get_master_sk().await?;
     let statsd_client = Arc::new(statsd::Client::new(opt.statsd_addr, "geph4.binder").unwrap());
@@ -94,6 +98,10 @@ impl BinderProtocol for BinderCoreWrapper {
 
     async fn authenticate_v2(&self, auth_req: AuthRequestV2) -> Result<AuthResponseV2, AuthError> {
         backoff(|| self.core_v2.authenticate_v2(&auth_req)).await
+    }
+
+    async fn get_login_url(&self, credentials: Credentials) -> Result<String, AuthError> {
+        Ok(String::new())
     }
 
     async fn validate(&self, token: BlindToken) -> bool {
@@ -214,6 +222,42 @@ impl BinderProtocol for BinderCoreWrapper {
             .map_err(|_| RpcError::CommFailed)?;
         self.melnode_cache.insert(cache_key, resp.clone());
         Ok(resp)
+    }
+
+    async fn add_metric(
+        &self,
+        session: i64,
+        data: serde_json::Value,
+    ) -> Result<(), MiscFatalError> {
+        let data_str = serde_json::to_string(&data).map_err(|e| {
+            log::error!("error serializing metric data: {:?}", e);
+            MiscFatalError::Database(e.to_string().into())
+        })?;
+
+        if data_str.as_bytes().len() > MAX_DATA_SIZE {
+            let e = format!("metric data exceeds {MAX_DATA_SIZE} byte limit");
+            log::error!("{}", e);
+            MiscFatalError::Database(e.into());
+        }
+
+        let session_bytes = bincode::serialize(&session).map_err(|e| {
+            log::error!("error serializing metric session: {:?}", e);
+            MiscFatalError::Database(e.to_string().into())
+        })?;
+        let data_hash = blake3::keyed_hash(METRIC_KEY, &session_bytes);
+        let hash_value: u64 = u64::from_be_bytes(data_hash.as_bytes()[0..8].try_into().unwrap());
+
+        if hash_value <= LOTTERY_THRESHOLD {
+            log::error!("metric under lottery threshold");
+            return Ok(());
+        }
+
+        self.core_v2.add_metric(session, data).await.map_err(|e| {
+            log::error!("error adding metric: {:?}", e);
+            MiscFatalError::Database(e.to_string().into())
+        })?;
+
+        Ok(())
     }
 }
 
