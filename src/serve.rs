@@ -25,8 +25,7 @@ use warp::Filter;
 use crate::{bindercore_v2::BinderCoreV2, Opt};
 
 const MAX_DATA_SIZE: usize = 2048;
-static LOTTERY_THRESHOLD: u64 = 9223372036854775808; // this threshold excludes ~50% of hashes
-const METRIC_KEY: &[u8; 32] = b"metric-data---------------------";
+const LOTTERY_THRESHOLD: u64 = 9223372036854775808; // this threshold excludes ~50% of hashes
 
 pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()> {
     let my_sk = core_v2.get_master_sk().await?;
@@ -240,7 +239,7 @@ impl BinderProtocol for BinderCoreWrapper {
             log::error!("error serializing metric session: {:?}", e);
             MiscFatalError::Database(e.to_string().into())
         })?;
-        let data_hash = blake3::keyed_hash(METRIC_KEY, &session_bytes);
+        let data_hash = blake3::hash(&session_bytes);
         let hash_value: u64 = u64::from_be_bytes(data_hash.as_bytes()[0..8].try_into().unwrap());
 
         if hash_value <= LOTTERY_THRESHOLD {

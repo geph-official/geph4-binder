@@ -2077,7 +2077,7 @@ dependencies = [
 [[package]]
 name = "geph4-protocol"
 version = "0.16.9"
-source = "git+https://github.com/geph-official/geph4-protocol?branch=metrics#b9e340465d5d75b170fcc4429a471d04e36114b9"
+source = "git+https://github.com/geph-official/geph4-protocol?branch=metrics#ae9721398e132e3c1c1420a3a610e726feb8e1e9"
 dependencies = [
  "acidjson",
  "anyhow",
