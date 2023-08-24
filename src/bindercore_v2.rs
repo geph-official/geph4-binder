@@ -870,6 +870,26 @@ impl BinderCoreV2 {
         };
         Ok(Some(response))
     }
+
+    pub async fn add_metric(
+        &self,
+        session: i64,
+        data: serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        let mut txn = self.postgres.begin().await?;
+
+        sqlx::query(
+            "insert into client_events (session, timestamp, data) values ($1, $2, $3) on conflict do nothing",
+        )
+        .bind(session)
+        .bind(Utc::now().naive_utc())
+        .bind(data)
+        .execute(&mut txn)
+        .await?;
+
+        txn.commit().await?;
+        Ok(())
+    }
 }
 
 /// Verify a captcha.

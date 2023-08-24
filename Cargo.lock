@@ -2076,9 +2076,8 @@ dependencies = [
 
 [[package]]
 name = "geph4-protocol"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b17dc7e24b676957c71ef328c96fbd10fb44482f23408baecc99cbc1e6b2c091"
+version = "0.16.9"
+source = "git+https://github.com/geph-official/geph4-protocol?branch=metrics#ae9721398e132e3c1c1420a3a610e726feb8e1e9"
 dependencies = [
  "acidjson",
  "anyhow",
@@ -2103,6 +2102,7 @@ dependencies = [
  "melbootstrap",
  "melprot",
  "melstructs",
+ "mini-moka",
  "mizaru",
  "nanorpc",
  "native-tls",
@@ -3050,6 +3050,21 @@ checksum = "4192263c238a5f0d0c6bfd21f336a313a4ce1c450542449ca191bb657b4642ef"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "mini-moka"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23e0b72e7c9042467008b10279fc732326bd605459ae03bda88825909dd19b56"
+dependencies = [
+ "crossbeam-channel",
+ "crossbeam-utils",
+ "dashmap 5.4.0",
+ "skeptic",
+ "smallvec",
+ "tagptr",
+ "triomphe",
 ]
 
 [[package]]
