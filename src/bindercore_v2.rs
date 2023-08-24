@@ -25,11 +25,8 @@ use itertools::Itertools;
 
 use moka::sync::Cache;
 
-use once_cell::sync::Lazy;
-
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::StatusCode;
-use rusty_pool::ThreadPool;
 use semver::{Version, VersionReq};
 use smol::Task;
 use smol_str::SmolStr;
@@ -138,7 +135,7 @@ impl BinderCoreV2 {
                                 .collect();
                             *cached_subscriptions.write() = mapping;
                         }
-                        smol::Timer::after(Duration::from_secs(fastrand::u64(0..60))).await;
+                        smol::Timer::after(Duration::from_secs(fastrand::u64(0..5))).await;
                     }
                 });
 
@@ -308,6 +305,20 @@ impl BinderCoreV2 {
         if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
             log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
             return Ok(Err(RegisterError::Other("incorrect captcha".into())));
+        }
+
+        if let Credentials::Signature {
+            pubkey,
+            unix_secs,
+            signature,
+        } = credentials.clone()
+        {
+            if !verify_pk_auth(pubkey, unix_secs, &signature) {
+                log::debug!("Credentials for {} were not able to be verified", pubkey);
+                return Ok(Err(RegisterError::Other(
+                    "Invalid keypair credentials".into(),
+                )));
+            }
         }
 
         // // TODO atomicity
@@ -705,12 +716,12 @@ impl BinderCoreV2 {
 
         // TODO rate limiting
 
-        // let mut txn = self.postgres.begin().await?;
-        // sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
-        //     .bind(user_info.userid)
-        //     .bind(Utc::now().naive_utc())
-        //     .execute(&mut txn)
-        //     .await?;
+        let mut txn = self.postgres.begin().await?;
+        sqlx::query("insert into auth_logs (id, last_login) values ($1, $2)")
+            .bind(user_info.userid)
+            .bind(Utc::now().naive_utc())
+            .execute(&mut txn)
+            .await?;
 
         // let (login_count,): (i64,) = sqlx::query_as(
         //         "select count (*) from (select distinct last_login from auth_logs where id = $1 and last_login + '1 day' > NOW()) as temp",
@@ -722,7 +733,8 @@ impl BinderCoreV2 {
         //     return Ok(Err(AuthError::TooManyRequests));
         // }
 
-        // txn.commit().await?;
+        txn.commit().await?;
+
         let req = auth_req.clone();
         let response = run_blocking(move || {
             let sig = key.blind_sign(req.epoch as usize, &req.blinded_digest);
@@ -737,6 +749,28 @@ impl BinderCoreV2 {
         log::info!("blind_sign took {:?}", start.elapsed());
 
         Ok(Ok(response))
+    }
+
+    pub async fn get_login_url(
+        &self,
+        credentials: Credentials,
+    ) -> anyhow::Result<String, AuthError> {
+        match credentials {
+            Credentials::Password { username, password } => Ok(format!(
+                "https://geph.io/billing/login?next=%2Fbilling%2Fdashboard&uname={}&pwd={}",
+                username, password
+            )),
+            Credentials::Signature {
+                pubkey,
+                unix_secs,
+                signature,
+            } => {
+                Ok(format!(
+                "https://geph.io/billing/login?next=%2Fbilling%2Fdashboard&pkey={}&secs={}&sig={}",
+                pubkey, unix_secs, hex::encode(signature)
+            ))
+            }
+        }
     }
 
     /// Validates a token
@@ -838,7 +872,7 @@ impl BinderCoreV2 {
             }
             Credentials::Signature { pubkey, .. } => {
                 sqlx::query_as("select user_id from auth_pubkey where pubkey = $1")
-                    .bind(pubkey.to_string())
+                    .bind(pubkey.0)
                     .fetch_optional(&mut txn)
                     .await?
             }
