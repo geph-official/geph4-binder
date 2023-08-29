@@ -13,7 +13,7 @@ use futures_lite::Future;
 use geph4_protocol::binder::protocol::{
     box_decrypt, box_encrypt, AuthError, AuthRequest, AuthRequestV2, AuthResponse, AuthResponseV2,
     BinderProtocol, BinderService, BlindToken, BridgeDescriptor, Captcha, Credentials, Level,
-    MasterSummary, MiscFatalError, RegisterError, RpcError,
+    MasterSummary, MiscFatalError, RegisterError, RpcError, UserInfoV2,
 };
 use melnet2::{wire::http::HttpBackhaul, Backhaul};
 use moka::sync::Cache;
@@ -97,10 +97,6 @@ impl BinderProtocol for BinderCoreWrapper {
 
     async fn authenticate_v2(&self, auth_req: AuthRequestV2) -> Result<AuthResponseV2, AuthError> {
         backoff(|| self.core_v2.authenticate_v2(&auth_req)).await
-    }
-
-    async fn get_login_url(&self, credentials: Credentials) -> Result<String, AuthError> {
-        self.core_v2.get_login_url(credentials).await
     }
 
     async fn validate(&self, token: BlindToken) -> bool {
@@ -223,6 +219,10 @@ impl BinderProtocol for BinderCoreWrapper {
         Ok(resp)
     }
 
+    async fn get_login_url(&self, credentials: Credentials) -> Result<String, AuthError> {
+        self.core_v2.get_login_url(credentials).await
+    }
+
     async fn add_metric(
         &self,
         session: i64,
@@ -257,6 +257,29 @@ impl BinderProtocol for BinderCoreWrapper {
         })?;
 
         Ok(())
+    }
+
+    async fn get_user_info(&self, credentials: Credentials) -> Result<UserInfoV2, MiscFatalError> {
+        match self.core_v2.verify(credentials.clone()).await {
+            Ok(is_verified) => {
+                if !is_verified {
+                    return Err(MiscFatalError::Auth(AuthError::InvalidCredentials));
+                }
+            }
+            Err(e) => {
+                return Err(MiscFatalError::Database(
+                    "Error verifying credentials".into(),
+                ))
+            }
+        }
+
+        if let Ok(Some(user_info)) = self.core_v2.get_user_info_v2(credentials).await {
+            return Ok(user_info);
+        } else {
+            return Err(MiscFatalError::Database(
+                "Error retrieving user info".into(),
+            ));
+        }
     }
 }
 

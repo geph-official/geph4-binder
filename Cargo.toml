@@ -51,7 +51,7 @@ jemallocator-global = "0.3.0"
 moka = "0.9.3"
 itertools = "0.10.3"
 
-geph4-protocol = { git = "https://github.com/geph-official/geph4-protocol", branch = "metrics" } # "0.16"
+geph4-protocol = { git = "https://github.com/geph-official/geph4-protocol", branch = "user-info" } # "0.16"
  
 async-trait = "0.1.57"
 async-oneshot = "0.5.0"

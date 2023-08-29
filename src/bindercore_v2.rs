@@ -792,7 +792,7 @@ impl BinderCoreV2 {
     }
 
     /// Verifies given credentials
-    async fn verify(&self, credentials: Credentials) -> anyhow::Result<bool> {
+    pub async fn verify(&self, credentials: Credentials) -> anyhow::Result<bool> {
         match credentials {
             Credentials::Password { username, password } => {
                 self.verify_password(username.as_str(), password.as_str())
@@ -887,7 +887,7 @@ impl BinderCoreV2 {
         }
     }
 
-    async fn get_user_info_v2(
+    pub async fn get_user_info_v2(
         &self,
         credentials: Credentials,
     ) -> Result<Option<UserInfoV2>, sqlx::Error> {

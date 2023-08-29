@@ -1992,8 +1992,8 @@ dependencies = [
 
 [[package]]
 name = "geph4-protocol"
-version = "0.16.9"
-source = "git+https://github.com/geph-official/geph4-protocol?branch=metrics#0959fa6d2ad2c859ea5b94c418f60f95664aaada"
+version = "0.17.0"
+source = "git+https://github.com/geph-official/geph4-protocol?branch=user-info#252e4df85bb3fbb4ce5888a4ca5fa39c690e3297"
 dependencies = [
  "acidjson",
  "anyhow",
@@ -4522,7 +4522,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with_macros 2.3.3",
- "time 0.3.27",
+ "time 0.3.28",
 ]
 
 [[package]]
@@ -5331,15 +5331,15 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.27"
+version = "0.3.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bb39ee79a6d8de55f48f2293a830e040392f1c5f16e336bdd1788cd0aadce07"
+checksum = "17f6bb557fd245c28e6411aa56b6403c689ad95061f50e4be16c274e70a17e48"
 dependencies = [
  "deranged",
  "itoa",
  "serde",
  "time-core",
- "time-macros 0.2.13",
+ "time-macros 0.2.14",
 ]
 
 [[package]]
@@ -5360,9 +5360,9 @@ dependencies = [
 
 [[package]]
 name = "time-macros"
-version = "0.2.13"
+version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "733d258752e9303d392b94b75230d07b0b9c489350c69b851fc6c065fde3e8f9"
+checksum = "1a942f44339478ef67935ab2bbaec2fb0322496cf3cbe84b261e06ac3814c572"
 dependencies = [
  "time-core",
 ]
