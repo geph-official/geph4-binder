@@ -259,27 +259,18 @@ impl BinderProtocol for BinderCoreWrapper {
         Ok(())
     }
 
-    async fn get_user_info(&self, credentials: Credentials) -> Result<UserInfoV2, MiscFatalError> {
-        match self.core_v2.verify(credentials.clone()).await {
-            Ok(is_verified) => {
-                if !is_verified {
-                    return Err(MiscFatalError::Auth(AuthError::InvalidCredentials));
+    async fn get_user_info(&self, credentials: Credentials) -> Result<UserInfoV2, AuthError> {
+        backoff(|| {
+            let credentials = credentials.clone();
+            async move {
+                if !self.core_v2.verify(credentials.clone()).await? {
+                    return Ok(Err(AuthError::InvalidCredentials));
                 }
+                let user_info = self.core_v2.get_user_info_v2(credentials).await?.unwrap();
+                Ok(Ok(user_info))
             }
-            Err(e) => {
-                return Err(MiscFatalError::Database(
-                    "Error verifying credentials".into(),
-                ))
-            }
-        }
-
-        if let Ok(Some(user_info)) = self.core_v2.get_user_info_v2(credentials).await {
-            return Ok(user_info);
-        } else {
-            return Err(MiscFatalError::Database(
-                "Error retrieving user info".into(),
-            ));
-        }
+        })
+        .await
     }
 }
 
