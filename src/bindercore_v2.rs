@@ -94,8 +94,8 @@ impl BinderCoreV2 {
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
             .max_connections(POOL_SIZE as _)
-            .acquire_timeout(Duration::from_secs(1))
-            .max_lifetime(Duration::from_secs(60))
+            .acquire_timeout(Duration::from_secs(60))
+            .max_lifetime(Duration::from_secs(600))
             .connect_with(
                 PgConnectOptions::from_str(database_url)?
                     .ssl_mode(PgSslMode::VerifyFull)
@@ -193,7 +193,9 @@ impl BinderCoreV2 {
 
             validate_cache: Cache::new(100000),
 
-            pwd_cache: Cache::new(100000),
+            pwd_cache: Cache::builder()
+                .time_to_idle(Duration::from_secs(3600))
+                .build(),
 
             _task,
         })
@@ -809,10 +811,10 @@ impl BinderCoreV2 {
     /// Verifies the password.
     async fn verify_password(&self, username: &str, password: &str) -> anyhow::Result<bool> {
         if let Some(val) = self.pwd_cache.get(&(username.into(), password.into())) {
-            log::info!("HIT for username {username}");
+            // log::info!("HIT for username {username}");
             return Ok(val);
         }
-        log::info!("MISS for username {username}");
+        // log::info!("MISS for username {username}");
         let mut txn = self.postgres.begin().await?;
         let (pwdhash,): (String,) = if let Some(v) =
             sqlx::query_as("select pwdhash from auth_password where username = $1")
