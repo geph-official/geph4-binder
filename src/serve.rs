@@ -236,7 +236,7 @@ impl BinderProtocol for BinderCoreWrapper {
         if data_str.as_bytes().len() > MAX_DATA_SIZE {
             let e = format!("metric data exceeds {MAX_DATA_SIZE} byte limit");
             log::error!("{}", e);
-            MiscFatalError::Database(e.into());
+            return Err(MiscFatalError::Database(e.into()));
         }
 
         let session_bytes = bincode::serialize(&session).map_err(|e| {
@@ -247,7 +247,6 @@ impl BinderProtocol for BinderCoreWrapper {
         let hash_value: u64 = u64::from_be_bytes(data_hash.as_bytes()[0..8].try_into().unwrap());
 
         if hash_value <= LOTTERY_THRESHOLD {
-            log::error!("metric under lottery threshold");
             return Ok(());
         }
 
