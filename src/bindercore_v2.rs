@@ -47,7 +47,7 @@ pub struct BinderCoreV2 {
     mizaru_sk: DashMap<Level, Shared<Task<mizaru::SecretKey>>>,
 
     // caches the network summary
-    summary_cache: Cache<(), MasterSummary>,
+    summary_cache: Arc<RwLock<Option<MasterSummary>>>,
 
     // caches the user info
     user_id_cache: Cache<Credentials, i32>,
@@ -65,8 +65,6 @@ pub struct BinderCoreV2 {
 
     // caches the "premium routes"
     premium_route_cache: Cache<(), imbl::HashSet<SmolStr>>,
-
-    bridge_secret_cache: Cache<(), Vec<u8>>,
 
     announcements_cache: Cache<(), String>,
 
@@ -105,15 +103,18 @@ impl BinderCoreV2 {
 
         let bridge_store = Arc::new(BridgeStore::default());
         let cached_subscriptions = Arc::new(RwLock::new(HashMap::new()));
+        let summary_cache = Arc::new(RwLock::new(None));
 
         let _task = {
             let postgres = postgres.clone();
             let statsd_client = statsd_client.clone();
             let bridge_store = bridge_store.clone();
             let cached_subscriptions = cached_subscriptions.clone();
+            let summary_cache = summary_cache.clone();
             smolscale::spawn(async move {
                 let postgres2 = postgres.clone();
-                let _task = smolscale::spawn(async move {
+                let postgres3 = postgres.clone();
+                let _refresh_cached_subs = smolscale::spawn(async move {
                     loop {
                         let rows: Result<Vec<(i32, String, f64)>, _> = sqlx::query_as(
                             "select id,plan,extract(epoch from expires) from subscriptions",
@@ -136,6 +137,92 @@ impl BinderCoreV2 {
                             *cached_subscriptions.write() = mapping;
                         }
                         smol::Timer::after(Duration::from_secs(fastrand::u64(0..5))).await;
+                    }
+                });
+
+                let _refresh_summary = smolscale::spawn(async move {
+                    loop {
+                        let fallible = async {
+                            let (bridge_secret,): (Vec<u8>,) = sqlx::query_as(
+                                "select value from secrets where key = 'bridge_secret'",
+                            )
+                            .fetch_one(&postgres3)
+                            .await?;
+                            let qresult: Vec<ExitRecord> = sqlx::query_as("select * from exits")
+                                .fetch_all(&postgres3)
+                                .await?;
+
+                            let mut exits = qresult
+                                .into_iter()
+                                .map(|exit| {
+                                    ExitDescriptor {
+                                        hostname: exit.hostname.into(),
+                                        signing_key: ed25519_dalek::PublicKey::from_bytes(
+                                            &exit.signing_key,
+                                        )
+                                        .unwrap(),
+                                        country_code: exit.country.into(),
+                                        city_code: exit.city.into(),
+                                        direct_routes: vec![], // fill in in the future
+                                        sosistab_e2e_pk: x25519_dalek::PublicKey::from(
+                                            exit.sosistab_key,
+                                        ),
+                                        allowed_levels: if exit.plus {
+                                            vec![Level::Plus]
+                                        } else {
+                                            vec![Level::Free, Level::Plus]
+                                        },
+                                        load: 9.99,
+                                    }
+                                })
+                                .collect_vec();
+                            {
+                                let exec = smol::Executor::new();
+                                let mut accum = vec![];
+                                for exit in exits.iter_mut() {
+                                    accum.push(exec.spawn(async {
+                                        let exit_addr =
+                                            smol::net::resolve(format!("{}:28080", exit.hostname))
+                                                .await?
+                                                .get(0)
+                                                .copied()
+                                                .context("no dns result for exit")?;
+                                        let transport = BridgeExitTransport::new(
+                                            *blake3::hash(&bridge_secret).as_bytes(),
+                                            exit_addr,
+                                        );
+                                        let client = BridgeExitClient(transport);
+                                        exit.load = client
+                                            .load_factor()
+                                            .timeout(Duration::from_millis(5000))
+                                            .await
+                                            .context(format!(
+                                                "timeout while asking for load from {}",
+                                                exit.hostname
+                                            ))??;
+                                        anyhow::Ok(())
+                                    }));
+                                }
+                                exec.run(async move {
+                                    for a in accum {
+                                        if let Err(err) = a.await {
+                                            log::warn!("failed: {:?}", err)
+                                        }
+                                    }
+                                })
+                                .await
+                            }
+                            let summ = MasterSummary {
+                                exits,
+                                bad_countries: vec!["cn".into(), "ir".into()],
+                            };
+                            *summary_cache.write() = Some(summ);
+                            anyhow::Ok(())
+                        };
+                        if let Err(err) = fallible.await {
+                            log::warn!("cannot refresh summary: {:?}", err)
+                        }
+                        smol::Timer::after(Duration::from_secs(30)).await;
                     }
                 });
 
@@ -162,9 +249,7 @@ impl BinderCoreV2 {
 
             mizaru_sk: Default::default(),
 
-            summary_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(600))
-                .build(),
+            summary_cache,
 
             epoch_key_cache: Cache::new(10000),
 
@@ -174,7 +259,6 @@ impl BinderCoreV2 {
 
             bridge_store,
 
-            bridge_secret_cache: Cache::new(100),
             cached_subscriptions,
 
             announcements_cache: Cache::builder()
@@ -301,9 +385,6 @@ impl BinderCoreV2 {
         captcha_id: &str,
         captcha_soln: &str,
     ) -> anyhow::Result<Result<(), RegisterError>> {
-        // EMERGENCY
-        // return Ok(Err(RegisterError::Other("too many requests".into())));
-
         if !verify_captcha(&self.captcha_service_url, captcha_id, captcha_soln).await? {
             log::debug!("{} is not soln to {}", captcha_soln, captcha_id);
             return Ok(Err(RegisterError::Other("incorrect captcha".into())));
@@ -457,85 +538,11 @@ impl BinderCoreV2 {
 
     /// Obtains the summary of the whole state.
     pub async fn get_summary(&self) -> anyhow::Result<MasterSummary> {
-        if let Some(summary) = self.summary_cache.get(&()) {
-            Ok(summary)
-        } else {
-            let bridge_secret = if let Some(bs) = self.bridge_secret_cache.get(&()) {
-                bs
-            } else {
-                let (bridge_secret,): (Vec<u8>,) =
-                    sqlx::query_as("select value from secrets where key = 'bridge_secret'")
-                        .fetch_one(&self.postgres)
-                        .await?;
-                self.bridge_secret_cache.insert((), bridge_secret.clone());
-                bridge_secret
-            };
-            let qresult: Vec<ExitRecord> = sqlx::query_as("select * from exits")
-                .fetch_all(&self.postgres)
-                .await?;
-
-            let mut exits = qresult
-                .into_iter()
-                .map(|exit| {
-                    ExitDescriptor {
-                        hostname: exit.hostname.into(),
-                        signing_key: ed25519_dalek::PublicKey::from_bytes(&exit.signing_key)
-                            .unwrap(),
-                        country_code: exit.country.into(),
-                        city_code: exit.city.into(),
-                        direct_routes: vec![], // fill in in the future
-                        sosistab_e2e_pk: x25519_dalek::PublicKey::from(exit.sosistab_key),
-                        allowed_levels: if exit.plus {
-                            vec![Level::Plus]
-                        } else {
-                            vec![Level::Free, Level::Plus]
-                        },
-                        load: 9.99,
-                    }
-                })
-                .collect_vec();
-            {
-                let exec = smol::Executor::new();
-                let mut accum = vec![];
-                for exit in exits.iter_mut() {
-                    accum.push(exec.spawn(async {
-                        let exit_addr = smol::net::resolve(format!("{}:28080", exit.hostname))
-                            .await?
-                            .get(0)
-                            .copied()
-                            .context("no dns result for exit")?;
-                        let transport = BridgeExitTransport::new(
-                            *blake3::hash(&bridge_secret).as_bytes(),
-                            exit_addr,
-                        );
-                        let client = BridgeExitClient(transport);
-                        exit.load = client
-                            .load_factor()
-                            .timeout(Duration::from_millis(500))
-                            .await
-                            .context(format!(
-                                "timeout while asking for load from {}",
-                                exit.hostname
-                            ))??;
-                        anyhow::Ok(())
-                    }));
-                }
-                exec.run(async move {
-                    for a in accum {
-                        if let Err(err) = a.await {
-                            log::warn!("failed: {:?}", err)
-                        }
-                    }
-                })
-                .await
-            }
-            let summ = MasterSummary {
-                exits,
-                bad_countries: vec!["cn".into(), "ir".into()],
-            };
-            self.summary_cache.insert((), summ.clone());
-            Ok(summ)
-        }
+        self.summary_cache
+            .read()
+            .as_ref()
+            .cloned()
+            .context("summary not available yet")
     }
 
     /// Obtains a list of bridges, filtered to only the bridges this user should care about.
@@ -858,7 +865,7 @@ impl BinderCoreV2 {
 
     async fn get_user_id(&self, credentials: &Credentials) -> Result<Option<i32>, sqlx::Error> {
         if let Some(val) = self.user_id_cache.get(credentials) {
-            log::info!("HIT for user id {val}");
+            // log::info!("HIT for user id {val}");
             return Ok(Some(val));
         }
         let mut txn = self.postgres.begin().await?;
@@ -881,7 +888,7 @@ impl BinderCoreV2 {
         };
         txn.commit().await?;
         if let Some(id) = id {
-            log::info!("MISS for user id {}", id.0);
+            // log::info!("MISS for user id {}", id.0);
             self.user_id_cache.insert(credentials.clone(), id.0);
             Ok(Some(id.0))
         } else {
