@@ -91,7 +91,7 @@ impl BinderCoreV2 {
         statsd_client: Arc<statsd::Client>,
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
-            .max_connections(POOL_SIZE as _)
+            .max_connections(100)
             .acquire_timeout(Duration::from_secs(60))
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
@@ -643,7 +643,7 @@ impl BinderCoreV2 {
                 .version
                 .as_ref()
                 .and_then(|v| Version::parse(v).ok())
-                .map(|v| v >= Version::parse("4.7.4").unwrap())
+                .map(|v| v >= Version::parse("4.10.0").unwrap())
                 .unwrap_or(false)
                 && bridge.protocol.contains("obfsudp")
                 && !bridge.is_direct
