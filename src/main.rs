@@ -16,8 +16,6 @@ use crate::serve::start_server;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-const POOL_SIZE: usize = 30;
-
 #[derive(Debug, StructOpt)]
 pub struct Opt {
     /// PostgreSQL database URL
@@ -60,7 +58,7 @@ fn main() -> anyhow::Result<()> {
                     record.args()
                 )
             })
-            .filter(Some("geph4_binder"), LevelFilter::Info)
+            .filter(Some("geph4_binder"), LevelFilter::Debug)
             .init();
 
         let opt = Opt::from_args();

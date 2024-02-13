@@ -59,14 +59,14 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                         &format!("latencyv2.{}", method),
                         start.elapsed().as_secs_f64(),
                     );
-                    if start.elapsed() > Duration::from_secs(1) {
-                        log::debug!(
-                            "** req {} of {} bts responded in {:.2}ms",
-                            method,
-                            s.len(),
-                            start.elapsed().as_secs_f64() * 1000.0
-                        );
-                    }
+                    // if start.elapsed() > Duration::from_secs(1) {
+                    log::trace!(
+                        "** req {} of {} bts responded in {:.2}ms",
+                        method,
+                        s.len(),
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    // }
                     let resp = serde_json::to_vec(&resp)?;
                     let resp = box_encrypt(&resp, my_sk, their_pk);
                     anyhow::Ok(resp)
@@ -265,8 +265,12 @@ impl BinderProtocol for BinderCoreWrapper {
                 if !self.core_v2.verify(credentials.clone()).await? {
                     return Ok(Err(AuthError::InvalidCredentials));
                 }
-                let user_info = self.core_v2.get_user_info_v2(credentials).await?.unwrap();
-                Ok(Ok(user_info))
+                let user_info = self.core_v2.get_user_info_v2(credentials).await?;
+                if let Some(user_info) = user_info {
+                    Ok(Ok(user_info))
+                } else {
+                    Ok(Err(AuthError::InvalidCredentials))
+                }
             }
         })
         .await

@@ -39,7 +39,7 @@ use sqlx::{
 };
 use tap::Tap;
 
-use crate::{bridge_store::BridgeStore, records::ExitRecord, run_blocking, POOL_SIZE};
+use crate::{bridge_store::BridgeStore, records::ExitRecord, run_blocking};
 
 pub struct BinderCoreV2 {
     captcha_service_url: SmolStr,
@@ -91,7 +91,7 @@ impl BinderCoreV2 {
         statsd_client: Arc<statsd::Client>,
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
-            .max_connections(100)
+            .max_connections(160)
             .acquire_timeout(Duration::from_secs(60))
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
@@ -231,6 +231,13 @@ impl BinderCoreV2 {
 
                     // clean up old bridges
                     bridge_store.delete_expired_bridges(200);
+
+                    sqlx::query(
+                        "delete from client_events where timestamp > NOW() - interval '7 day'",
+                    )
+                    .execute(&postgres)
+                    .await
+                    .unwrap();
 
                     let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
                     .fetch_one(& postgres)
@@ -570,6 +577,7 @@ impl BinderCoreV2 {
                 .unwrap_or_else(|| "old".into())
                 .replace('.', "-")
         ));
+
         let opaque_id = blake3::hash(&bincode::serialize(&token).unwrap());
         if let Some(bridges) = self
             .bridge_per_key
@@ -635,7 +643,7 @@ impl BinderCoreV2 {
             .as_bytes()
         });
         // go through the sorted version, "deduplicating" by the group+protocol pair.
-        let mut seen = HashSet::new();
+        let mut seen: HashMap<_, usize> = HashMap::new();
         let mut gathered = vec![];
         for bridge in all_bridges {
             // only show obfsudp bridges if the version number is new enough
@@ -650,9 +658,14 @@ impl BinderCoreV2 {
             {
                 continue;
             }
-            if (token.level == Level::Plus || !premium_routes.contains(bridge.alloc_group.as_str()))
-                && seen.insert((bridge.alloc_group.clone(), bridge.protocol.clone()))
-            {
+            if token.level == Level::Plus || !premium_routes.contains(bridge.alloc_group.as_str()) {
+                let lala = seen
+                    .entry((bridge.alloc_group.clone(), bridge.protocol.clone()))
+                    .or_default();
+                *lala += 1;
+                if *lala > 2 {
+                    continue;
+                }
                 gathered.push(bridge);
             }
         }
