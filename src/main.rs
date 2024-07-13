@@ -4,7 +4,6 @@ mod records;
 mod serve;
 
 use log::LevelFilter;
-use mimalloc::MiMalloc;
 use once_cell::sync::Lazy;
 use rusty_pool::ThreadPool;
 
@@ -13,8 +12,12 @@ use structopt::StructOpt;
 
 use crate::serve::start_server;
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Debug, StructOpt)]
 pub struct Opt {
@@ -44,6 +47,7 @@ pub struct Opt {
 }
 
 fn main() -> anyhow::Result<()> {
+    // smolscale::permanently_single_threaded();
     smolscale::block_on(async {
         env_logger::Builder::new()
             .format(|buf, record| {
@@ -85,7 +89,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn run_blocking<T: Send + Sync + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     static POOL: Lazy<ThreadPool> =
-        Lazy::new(|| ThreadPool::new(1, num_cpus::get(), Duration::from_secs(10)));
+        Lazy::new(|| ThreadPool::new(1, num_cpus::get(), Duration::from_secs(600)));
     let (mut send, recv) = async_oneshot::oneshot();
     POOL.execute(move || {
         let t = f();
