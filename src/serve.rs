@@ -19,6 +19,7 @@ use melnet2::{wire::http::HttpBackhaul, Backhaul};
 use moka::sync::Cache;
 use nanorpc::{DynRpcTransport, JrpcRequest, JrpcResponse, RpcService, RpcTransport};
 use once_cell::sync::Lazy;
+use smol::lock::Semaphore;
 use smol_str::SmolStr;
 use warp::Filter;
 
@@ -48,6 +49,16 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
             let bcw = bcw.clone();
             let statsd_client = statsd_client.clone();
             async move {
+                static CONCURRENCY_LIMIT: Semaphore = Semaphore::new(100);
+                let _guard = CONCURRENCY_LIMIT.try_acquire();
+                if _guard.is_none() {
+                    // log::warn!("exceeded concurrency limit, slowing down");
+                    return http::Response::builder()
+                        .status(http::StatusCode::TOO_MANY_REQUESTS)
+                        .body(Bytes::from_static(b"Too Many Requests"))
+                        .unwrap();
+                }
+
                 let fallible = smolscale::spawn(async move {
                     let (decrypted, their_pk) = box_decrypt(&s, my_sk.clone())?;
                     let start = Instant::now();
@@ -59,22 +70,27 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                         &format!("latencyv2.{}", method),
                         start.elapsed().as_secs_f64(),
                     );
-                    // if start.elapsed() > Duration::from_secs(1) {
                     log::trace!(
                         "** req {} of {} bts responded in {:.2}ms",
                         method,
                         s.len(),
                         start.elapsed().as_secs_f64() * 1000.0
                     );
-                    // }
                     let resp = serde_json::to_vec(&resp)?;
                     let resp = box_encrypt(&resp, my_sk, their_pk);
                     anyhow::Ok(resp)
                 });
-                if let Ok(res) = fallible.await {
-                    res.to_vec()
-                } else {
-                    Bytes::new().to_vec()
+                match fallible.await {
+                    Ok(res) => http::Response::builder().body(res).unwrap(),
+                    Err(e) => {
+                        log::error!("error handling request: {:?}", e);
+                        http::Response::builder()
+                            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Bytes::copy_from_slice(
+                                format!("internal server error: {:?}", e).as_bytes(),
+                            ))
+                            .unwrap()
+                    }
                 }
             }
         });
@@ -189,34 +205,8 @@ impl BinderProtocol for BinderCoreWrapper {
     }
 
     /// Reverse proxies requests to melnode
-    async fn reverse_proxy_melnode(&self, req: JrpcRequest) -> Result<JrpcResponse, RpcError> {
-        let cache_key = bincode::serialize(&(&req.method, &req.params)).unwrap();
-        if let Some(mut cached) = self.melnode_cache.get(&cache_key) {
-            cached.id = req.id;
-            return Ok(cached);
-        }
-
-        // find a melnode and connect to it
-        let bootstrap_routes = melbootstrap::bootstrap_routes(melstructs::NetID::Mainnet);
-        let route = *bootstrap_routes
-            .first()
-            .context("Error retreiving bootstrap routes")
-            .map_err(|_| RpcError::BootstrapFailed)?;
-        static BACKHAUL: Lazy<HttpBackhaul> = Lazy::new(HttpBackhaul::new);
-        let rpc_transport = DynRpcTransport::new(
-            BACKHAUL
-                .connect(route.to_string().into())
-                .await
-                .map_err(|_| RpcError::ConnectFailed)?,
-        );
-
-        // send!
-        let resp = rpc_transport
-            .call_raw(req)
-            .await
-            .map_err(|_| RpcError::CommFailed)?;
-        self.melnode_cache.insert(cache_key, resp.clone());
-        Ok(resp)
+    async fn reverse_proxy_melnode(&self, _req: JrpcRequest) -> Result<JrpcResponse, RpcError> {
+        Err(RpcError::CommFailed)
     }
 
     async fn get_login_url(&self, credentials: Credentials) -> Result<String, AuthError> {
