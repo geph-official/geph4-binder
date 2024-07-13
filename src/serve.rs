@@ -22,7 +22,7 @@ use once_cell::sync::Lazy;
 use smol_str::SmolStr;
 use warp::Filter;
 
-use crate::{bindercore_v2::BinderCoreV2, Opt};
+use crate::{bindercore_v2::BinderCoreV2, run_blocking, Opt};
 
 const MAX_DATA_SIZE: usize = 2048;
 const LOTTERY_THRESHOLD: u64 = 9223372036854775808; // this threshold excludes ~50% of hashes
@@ -49,7 +49,11 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
             let statsd_client = statsd_client.clone();
             async move {
                 let fallible = smolscale::spawn(async move {
-                    let (decrypted, their_pk) = box_decrypt(&s, my_sk.clone())?;
+                    let (decrypted, their_pk) = run_blocking({
+                        let my_sk = my_sk.clone();
+                        move || box_decrypt(&s, my_sk.clone())
+                    })
+                    .await?;
                     let start = Instant::now();
                     let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
                     statsd_client.incr(&req.method);
@@ -61,14 +65,13 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                     );
                     // if start.elapsed() > Duration::from_secs(1) {
                     log::trace!(
-                        "** req {} of {} bts responded in {:.2}ms",
+                        "** req {} responded in {:.2}ms",
                         method,
-                        s.len(),
                         start.elapsed().as_secs_f64() * 1000.0
                     );
                     // }
                     let resp = serde_json::to_vec(&resp)?;
-                    let resp = box_encrypt(&resp, my_sk, their_pk);
+                    let resp = run_blocking(move || box_encrypt(&resp, my_sk, their_pk)).await;
                     anyhow::Ok(resp)
                 });
                 if let Ok(res) = fallible.await {

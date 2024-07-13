@@ -565,9 +565,13 @@ impl BinderCoreV2 {
                 .context(format!("failed to parse token version {}", version))?;
             req.matches(&version)
         } else {
-            // NOTE: only VERY old clients don't have a version set on their auth tokens
-            true
+            // NOTE: probably iOS rather than actually old
+            false
         };
+
+        // if is_legacy {
+        //     return Ok(vec![]);
+        // }
 
         self.statsd_client.incr(&format!(
             "gb_versions.{}",
@@ -932,18 +936,18 @@ impl BinderCoreV2 {
         session: i64,
         data: serde_json::Value,
     ) -> Result<(), sqlx::Error> {
-        let mut txn = self.postgres.begin().await?;
+        // let mut txn = self.postgres.begin().await?;
 
-        sqlx::query(
-            "insert into client_events (session, timestamp, data) values ($1, $2, $3) on conflict do nothing",
-        )
-        .bind(session)
-        .bind(Utc::now().naive_utc())
-        .bind(data)
-        .execute(&mut txn)
-        .await?;
+        // sqlx::query(
+        //     "insert into client_events (session, timestamp, data) values ($1, $2, $3) on conflict do nothing",
+        // )
+        // .bind(session)
+        // .bind(Utc::now().naive_utc())
+        // .bind(data)
+        // .execute(&mut txn)
+        // .await?;
 
-        txn.commit().await?;
+        // txn.commit().await?;
         Ok(())
     }
 }
