@@ -184,7 +184,7 @@ impl BinderCoreV2 {
                                         let exit_addr =
                                             smol::net::resolve(format!("{}:28080", exit.hostname))
                                                 .await?
-                                                .get(0)
+                                                .first()
                                                 .copied()
                                                 .context("no dns result for exit")?;
                                         let transport = BridgeExitTransport::new(
@@ -436,6 +436,11 @@ impl BinderCoreV2 {
 
         match credentials {
             Credentials::Password { username, password } => {
+                if username != username.to_lowercase() || username != username.trim() {
+                    return Ok(Err(RegisterError::Other(
+                        "username must be lowercase and not contain whitespace".into(),
+                    )));
+                }
                 sqlx::query(
                     "insert into auth_password (user_id, username, pwdhash) values ($1, $2, $3) on conflict do nothing"
                 )
