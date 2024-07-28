@@ -16,14 +16,17 @@ use geph4_protocol::binder::protocol::{
     MasterSummary, MiscFatalError, RegisterError, RpcError, UserInfoV2,
 };
 use melnet2::{wire::http::HttpBackhaul, Backhaul};
-use moka::sync::Cache;
+use moka::future::Cache;
 use nanorpc::{DynRpcTransport, JrpcRequest, JrpcResponse, RpcService, RpcTransport};
 use once_cell::sync::Lazy;
 use smol::lock::Semaphore;
 use smol_str::SmolStr;
 use warp::Filter;
 
-use crate::{bindercore_v2::BinderCoreV2, run_blocking, Opt};
+use crate::{
+    bindercore_v2::{BinderCoreV2, POOL_SIZE},
+    run_blocking, Opt,
+};
 
 const MAX_DATA_SIZE: usize = 2048;
 const LOTTERY_THRESHOLD: u64 = 9223372036854775808; // this threshold excludes ~50% of hashes
@@ -49,15 +52,15 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
             let bcw = bcw.clone();
             let statsd_client = statsd_client.clone();
             async move {
-                static CONCURRENCY_LIMIT: Semaphore = Semaphore::new(100);
-                let _guard = CONCURRENCY_LIMIT.try_acquire();
-                if _guard.is_none() {
-                    // log::warn!("exceeded concurrency limit, slowing down");
-                    return http::Response::builder()
-                        .status(http::StatusCode::TOO_MANY_REQUESTS)
-                        .body(Bytes::from_static(b"Too Many Requests"))
-                        .unwrap();
-                }
+                static CONCURRENCY_LIMIT: Semaphore = Semaphore::new(POOL_SIZE as _);
+                let _guard = CONCURRENCY_LIMIT.acquire().await;
+                // if _guard.is_none() {
+                //     // log::warn!("exceeded concurrency limit, slowing down");
+                //     return http::Response::builder()
+                //         .status(http::StatusCode::TOO_MANY_REQUESTS)
+                //         .body(Bytes::from_static(b"Too Many Requests"))
+                //         .unwrap();
+                // }
 
                 let fallible = smolscale::spawn(async move {
                     let (decrypted, their_pk) = run_blocking({
@@ -74,11 +77,14 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                         &format!("latencyv2.{}", method),
                         start.elapsed().as_secs_f64(),
                     );
-                    log::trace!(
-                        "** req {} responded in {:.2}ms",
-                        method,
-                        start.elapsed().as_secs_f64() * 1000.0
-                    );
+                    let latency = start.elapsed();
+                    if latency > Duration::from_millis(100) {
+                        log::warn!(
+                            "** req {} responded in {:.2}ms",
+                            method,
+                            latency.as_secs_f64() * 1000.0
+                        );
+                    }
                     let resp = serde_json::to_vec(&resp)?;
                     let resp = run_blocking(move || box_encrypt(&resp, my_sk, their_pk)).await;
                     anyhow::Ok(resp)

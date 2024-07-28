@@ -23,7 +23,7 @@ use geph4_protocol::{
 };
 use itertools::Itertools;
 
-use moka::sync::Cache;
+use moka::future::Cache;
 
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::StatusCode;
@@ -82,6 +82,8 @@ pub struct BinderCoreV2 {
     _task: Task<()>,
 }
 
+pub const POOL_SIZE: u32 = 300;
+
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
     pub async fn connect(
@@ -91,8 +93,8 @@ impl BinderCoreV2 {
         statsd_client: Arc<statsd::Client>,
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
-            .max_connections(160)
-            .acquire_timeout(Duration::from_secs(60))
+            .max_connections(POOL_SIZE + 20)
+            .acquire_timeout(Duration::from_secs(10))
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
                 PgConnectOptions::from_str(database_url)?
@@ -269,7 +271,7 @@ impl BinderCoreV2 {
             cached_subscriptions,
 
             announcements_cache: Cache::builder()
-                .time_to_live(Duration::from_secs(10))
+                .time_to_live(Duration::from_secs(600))
                 .build(),
 
             premium_route_cache: Cache::builder()
@@ -356,14 +358,14 @@ impl BinderCoreV2 {
 
     /// Get a per-epoch key.
     pub async fn get_epoch_key(&self, level: Level, epoch: usize) -> rsa::RSAPublicKey {
-        if let Some(v) = self.epoch_key_cache.get(&(level, epoch)) {
-            v
-        } else {
-            let mizaru_sk = self.get_mizaru_sk(level).await;
-            let public = mizaru_sk.get_subkey(epoch).to_public_key();
-            self.epoch_key_cache.insert((level, epoch), public.clone());
-            public
-        }
+        self.epoch_key_cache
+            .try_get_with((level, epoch), async {
+                let mizaru_sk = self.get_mizaru_sk(level).await;
+                let public = mizaru_sk.get_subkey(epoch).to_public_key();
+                anyhow::Ok(public)
+            })
+            .await
+            .unwrap()
     }
 
     /// Creates a new user, consuming a captcha answer.
@@ -588,98 +590,104 @@ impl BinderCoreV2 {
         ));
 
         let opaque_id = blake3::hash(&bincode::serialize(&token).unwrap());
-        if let Some(bridges) = self
+        let bridges_key = blake3::keyed_hash(opaque_id.as_bytes(), exit.as_bytes());
+        let bridges = self
             .bridge_per_key
-            .get(&blake3::keyed_hash(opaque_id.as_bytes(), exit.as_bytes()))
-        {
-            return Ok(bridges);
-        }
-        if !self.validate(token.clone()).await && validate {
-            log::warn!("got invalid token in get_bridges");
-            return Ok(vec![]);
-        }
-
-        let summary = self.get_summary().await?;
-        let exit_record = summary.exits.iter().find(|e| e.hostname == exit);
-        let exit_record = if let Some(r) = exit_record {
-            r
-        } else {
-            return Ok(vec![]);
-        };
-        let sosistab2_e2e_key = exit_record.sosistab_e2e_pk;
-
-        let mut all_bridges: Vec<BridgeDescriptor> = self
-            .bridge_store
-            .get_bridges(exit)
-            .iter()
-            .filter_map(|bridge| {
-                let mut bridge = bridge.clone();
-                // NOTE: handle legacy calls by encoding both the pipe-specific cookie and the e2e key
-                let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp") {
-                    let cookie_bytes: [u8; 32] = bridge.cookie.as_ref().try_into().ok()?;
-                    let cookie = ObfsUdpPublic::from_bytes(cookie_bytes);
-                    bincode::serialize(&(cookie, sosistab2_e2e_key))
-                        .unwrap()
-                        .into()
-                } else {
-                    bridge.cookie
-                };
-                bridge.cookie = cookie_or_tuple;
-                Some(bridge)
-            })
-            .collect();
-
-        let premium_routes = if let Some(routes) = self.premium_route_cache.get(&()) {
-            routes
-        } else {
-            let premium_routes: Vec<(String,)> =
-                sqlx::query_as("select bridge_group from route_premium")
-                    .fetch_all(&self.postgres)
-                    .await?;
-            let premium_routes: imbl::HashSet<SmolStr> = premium_routes
-                .into_iter()
-                .map(|s| SmolStr::from(s.0.as_str()))
-                .collect();
-            self.premium_route_cache.insert((), premium_routes.clone());
-            premium_routes
-        };
-        // sort by rendezvous hashing
-        all_bridges.sort_unstable_by_key(|bridge| {
-            *blake3::keyed_hash(
-                opaque_id.as_bytes(),
-                &bincode::serialize(&bridge.endpoint.ip()).unwrap(),
-            )
-            .as_bytes()
-        });
-        // go through the sorted version, "deduplicating" by the group+protocol pair.
-        let mut seen: HashMap<_, usize> = HashMap::new();
-        let mut gathered = vec![];
-        for bridge in all_bridges {
-            // only show obfsudp bridges if the version number is new enough
-            if !token
-                .version
-                .as_ref()
-                .and_then(|v| Version::parse(v).ok())
-                .map(|v| v >= Version::parse("4.10.0").unwrap())
-                .unwrap_or(false)
-                && bridge.protocol.contains("obfsudp")
-                && !bridge.is_direct
-            {
-                continue;
-            }
-            if token.level == Level::Plus || !premium_routes.contains(bridge.alloc_group.as_str()) {
-                let lala = seen
-                    .entry((bridge.alloc_group.clone(), bridge.protocol.clone()))
-                    .or_default();
-                *lala += 1;
-                if *lala > 2 {
-                    continue;
+            .try_get_with(bridges_key, async {
+                if !self.validate(token.clone()).await && validate {
+                    log::warn!("got invalid token in get_bridges");
+                    return Ok(vec![]);
                 }
-                gathered.push(bridge);
-            }
-        }
-        self.bridge_per_key.insert(opaque_id, gathered.clone());
-        Ok(gathered)
+
+                let summary = self.get_summary().await?;
+                let exit_record = summary.exits.iter().find(|e| e.hostname == exit);
+                let exit_record = if let Some(r) = exit_record {
+                    r
+                } else {
+                    return Ok(vec![]);
+                };
+                let sosistab2_e2e_key = exit_record.sosistab_e2e_pk;
+
+                let mut all_bridges: Vec<BridgeDescriptor> = self
+                    .bridge_store
+                    .get_bridges(exit)
+                    .iter()
+                    .filter_map(|bridge| {
+                        let mut bridge = bridge.clone();
+                        // NOTE: handle legacy calls by encoding both the pipe-specific cookie and the e2e key
+                        let cookie_or_tuple: Bytes = if is_legacy && bridge.protocol.contains("udp")
+                        {
+                            let cookie_bytes: [u8; 32] = bridge.cookie.as_ref().try_into().ok()?;
+                            let cookie = ObfsUdpPublic::from_bytes(cookie_bytes);
+                            bincode::serialize(&(cookie, sosistab2_e2e_key))
+                                .unwrap()
+                                .into()
+                        } else {
+                            bridge.cookie
+                        };
+                        bridge.cookie = cookie_or_tuple;
+                        Some(bridge)
+                    })
+                    .collect();
+
+                let premium_routes = self
+                    .premium_route_cache
+                    .try_get_with((), async {
+                        let premium_routes: Vec<(String,)> =
+                            sqlx::query_as("select bridge_group from route_premium")
+                                .fetch_all(&self.postgres)
+                                .await?;
+                        let premium_routes: imbl::HashSet<SmolStr> = premium_routes
+                            .into_iter()
+                            .map(|s| SmolStr::from(s.0.as_str()))
+                            .collect();
+                        Ok(premium_routes) as anyhow::Result<_>
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                // sort by rendezvous hashing
+                all_bridges.sort_unstable_by_key(|bridge| {
+                    *blake3::keyed_hash(
+                        opaque_id.as_bytes(),
+                        &bincode::serialize(&bridge.endpoint.ip()).unwrap(),
+                    )
+                    .as_bytes()
+                });
+                // go through the sorted version, "deduplicating" by the group+protocol pair.
+                let mut seen: HashMap<_, usize> = HashMap::new();
+                let mut gathered = vec![];
+                for bridge in all_bridges {
+                    // only show obfsudp bridges if the version number is new enough
+                    if !token
+                        .version
+                        .as_ref()
+                        .and_then(|v| Version::parse(v).ok())
+                        .map(|v| v >= Version::parse("4.10.0").unwrap())
+                        .unwrap_or(false)
+                        && bridge.protocol.contains("obfsudp")
+                        && !bridge.is_direct
+                    {
+                        continue;
+                    }
+                    if token.level == Level::Plus
+                        || !premium_routes.contains(bridge.alloc_group.as_str())
+                    {
+                        let lala = seen
+                            .entry((bridge.alloc_group.clone(), bridge.protocol.clone()))
+                            .or_default();
+                        *lala += 1;
+                        if *lala > 2 {
+                            continue;
+                        }
+                        gathered.push(bridge);
+                    }
+                }
+                anyhow::Ok(gathered)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        Ok(bridges)
     }
 
     /// Validates the username and password.
@@ -807,19 +815,19 @@ impl BinderCoreV2 {
     /// Validates a token
     pub async fn validate(&self, token: BlindToken) -> bool {
         let cache_key = blake3::hash(&bincode::serialize(&token).unwrap());
-        if let Some(val) = self.validate_cache.get(&cache_key) {
-            return val;
-        }
-        let key = self.get_mizaru_sk(token.level).await.to_public_key();
-        let value = key.blind_verify(
-            &token.unblinded_digest,
-            &match bincode::deserialize(&token.unblinded_signature_bincode) {
-                Ok(v) => v,
-                _ => return false,
-            },
-        );
-        self.validate_cache.insert(cache_key, value);
-        value
+        self.validate_cache
+            .get_with(cache_key, async {
+                let key = self.get_mizaru_sk(token.level).await.to_public_key();
+                let value = key.blind_verify(
+                    &token.unblinded_digest,
+                    &match bincode::deserialize(&token.unblinded_signature_bincode) {
+                        Ok(v) => v,
+                        _ => return false,
+                    },
+                );
+                value
+            })
+            .await
     }
 
     /// Verifies given credentials
@@ -839,7 +847,11 @@ impl BinderCoreV2 {
 
     /// Verifies the password.
     async fn verify_password(&self, username: &str, password: &str) -> anyhow::Result<bool> {
-        if let Some(val) = self.pwd_cache.get(&(username.into(), password.into())) {
+        if let Some(val) = self
+            .pwd_cache
+            .get(&(username.into(), password.into()))
+            .await
+        {
             // log::info!("HIT for username {username}");
             return Ok(val);
         }
@@ -857,36 +869,33 @@ impl BinderCoreV2 {
         };
         if verify_libsodium_password(password.to_string(), pwdhash).await {
             self.pwd_cache
-                .insert((username.into(), password.into()), true);
+                .insert((username.into(), password.into()), true)
+                .await;
             Ok(true)
         } else {
             self.pwd_cache
-                .insert((username.into(), password.into()), false);
+                .insert((username.into(), password.into()), false)
+                .await;
             Ok(false)
         }
     }
 
     /// Gets announcements.
     pub async fn get_announcements(&self) -> String {
-        if let Some(ann) = self.announcements_cache.get(&()) {
-            return ann;
-        }
-        loop {
-            let fallible = async {
-                let resp = reqwest::get("https://rsshub.app/telegram/channel/gephannounce").await?;
+        self.announcements_cache
+            .try_get_with((), async {
+                let resp = reqwest::get("https://rsshub.app/telegram/channel/gephannounce")
+                    .compat()
+                    .await?;
                 let bts = resp.bytes().await?;
                 anyhow::Ok(String::from_utf8_lossy(&bts).to_string())
-            }
-            .compat();
-            if let Ok(val) = fallible.await {
-                self.announcements_cache.insert((), val.clone());
-                return val;
-            }
-        }
+            })
+            .await
+            .unwrap_or_else(|_| "Failed to fetch announcements".to_string())
     }
 
     async fn get_user_id(&self, credentials: &Credentials) -> Result<Option<i32>, sqlx::Error> {
-        if let Some(val) = self.user_id_cache.get(credentials) {
+        if let Some(val) = self.user_id_cache.get(credentials).await {
             // log::info!("HIT for user id {val}");
             return Ok(Some(val));
         }
@@ -911,7 +920,7 @@ impl BinderCoreV2 {
         txn.commit().await?;
         if let Some(id) = id {
             // log::info!("MISS for user id {}", id.0);
-            self.user_id_cache.insert(credentials.clone(), id.0);
+            self.user_id_cache.insert(credentials.clone(), id.0).await;
             Ok(Some(id.0))
         } else {
             Ok(None)
