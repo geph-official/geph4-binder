@@ -1030,15 +1030,15 @@ async fn hash_libsodium_password(password: &str) -> String {
         let mut output = vec![0u8; 1024];
         let res = unsafe {
             libsodium_sys::crypto_pwhash_str(
-                output.as_mut_ptr() as *mut i8,
-                password.as_ptr() as *const i8,
+                output.as_mut_ptr() as _,
+                password.as_ptr() as _,
                 password.len() as u64,
                 libsodium_sys::crypto_pwhash_OPSLIMIT_INTERACTIVE as u64 / 2,
                 libsodium_sys::crypto_pwhash_MEMLIMIT_INTERACTIVE as usize / 2,
             )
         };
         assert_eq!(res, 0);
-        let cstr = unsafe { CStr::from_ptr(output.as_ptr() as *const i8) };
+        let cstr = unsafe { CStr::from_ptr(output.as_ptr() as _) };
         cstr.to_str().unwrap().to_owned()
     })
     .await
