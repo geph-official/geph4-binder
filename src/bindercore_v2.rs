@@ -1015,7 +1015,7 @@ async fn verify_libsodium_password(password: String, hash: String) -> bool {
         let res = unsafe {
             libsodium_sys::crypto_pwhash_str_verify(
                 hash.as_ptr(),
-                password.as_ptr() as *const i8,
+                password.as_ptr() as _,
                 password.len() as u64,
             )
         };

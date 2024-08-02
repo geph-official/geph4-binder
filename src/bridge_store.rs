@@ -11,70 +11,51 @@ type UpdateTimestamp = u64;
 type BridgeId = (SmolStr, SocketAddr);
 type BridgeInfo = (BridgeDescriptor, UpdateTimestamp);
 
+#[derive(Default)]
 pub struct BridgeStore {
     store: DashMap<BridgeId, BridgeInfo>,
-    exit_index: DashMap<SmolStr, Vec<BridgeId>>,
-}
-
-impl Default for BridgeStore {
-    fn default() -> Self {
-        BridgeStore {
-            store: DashMap::new(),
-            exit_index: DashMap::new(),
-        }
-    }
 }
 
 impl BridgeStore {
     pub fn add_bridge(&self, bridge: &BridgeDescriptor) {
         let id = (bridge.protocol.clone(), bridge.endpoint);
-        self.store
-            .insert(id.clone(), (bridge.clone(), bridge.update_time));
-
-        self.exit_index
-            .entry(bridge.exit_hostname.clone())
-            .or_default()
-            .push(id);
+        self.store.insert(id, (bridge.clone(), bridge.update_time));
     }
 
     pub fn get_bridges(&self, exit_hostname: SmolStr) -> Vec<BridgeDescriptor> {
-        self.exit_index
-            .get(&exit_hostname)
-            .map(|bridge_ids| {
-                bridge_ids
-                    .iter()
-                    .filter_map(|id| self.store.get(id).map(|bridge_info| bridge_info.0.clone()))
-                    .collect()
+        self.store
+            .clone()
+            .into_iter()
+            .map(|pair| {
+                let bridge_info = pair.1;
+                bridge_info.0
             })
-            .unwrap_or_default()
+            .filter(|bridge| bridge.exit_hostname == exit_hostname)
+            .collect()
     }
 
     pub fn delete_bridge(&self, bridge_id: &BridgeId) {
-        if let Some((_, (bridge, _))) = self.store.remove(bridge_id) {
-            if let Some(mut exit_bridges) = self.exit_index.get_mut(&bridge.exit_hostname) {
-                exit_bridges.retain(|id| id != bridge_id);
-            }
-        }
+        self.store.remove(bridge_id);
     }
 
     pub fn delete_expired_bridges(&self, time_to_live_secs: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let expired: Vec<_> = self
-            .store
-            .iter()
+        self.store
+            .clone()
+            .into_iter()
             .filter(|pair| {
-                let (_, (_, update_time)) = pair.pair();
-                *update_time < now - time_to_live_secs
-            })
-            .map(|pair| pair.key().clone())
-            .collect();
+                let bridge_info = pair.1.clone();
+                let update_time = bridge_info.1;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
 
-        for id in expired {
-            self.delete_bridge(&id);
-        }
+                // bridges expire after the given TTL
+                update_time < now - time_to_live_secs
+            })
+            .for_each(|pair| {
+                let id = pair.0;
+                self.delete_bridge(&id);
+            })
     }
 }
