@@ -83,7 +83,7 @@ pub struct BinderCoreV2 {
     _task: Task<()>,
 }
 
-pub const POOL_SIZE: u32 = 50;
+pub const POOL_SIZE: u32 = 300;
 
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
@@ -94,7 +94,7 @@ impl BinderCoreV2 {
         statsd_client: Arc<statsd::Client>,
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
-            .max_connections(POOL_SIZE + 20)
+            .max_connections(POOL_SIZE)
             .acquire_timeout(Duration::from_secs(10))
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
@@ -611,7 +611,7 @@ impl BinderCoreV2 {
 
                 let mut all_bridges: Vec<BridgeDescriptor> = self
                     .bridge_store
-                    .get_bridges(&exit)
+                    .get_bridges(exit)
                     .iter()
                     .filter_map(|bridge| {
                         let mut bridge = bridge.clone();
@@ -778,12 +778,10 @@ impl BinderCoreV2 {
         let req = auth_req.clone();
         let response = run_blocking(move || {
             let sig = key.blind_sign(req.epoch as usize, &req.blinded_digest);
-            let response = AuthResponseV2 {
+            AuthResponseV2 {
                 user_info,
                 blind_signature_bincode: bincode::serialize(&sig).unwrap().into(),
-            };
-
-            response
+            }
         })
         .await;
         log::info!("blind_sign took {:?}", start.elapsed());

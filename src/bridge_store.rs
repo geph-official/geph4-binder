@@ -1,62 +1,58 @@
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use dashmap::DashMap;
 use geph4_protocol::binder::protocol::BridgeDescriptor;
-use parking_lot::RwLock;
 use smol_str::SmolStr;
 
 type UpdateTimestamp = u64;
 type BridgeId = (SmolStr, SocketAddr);
 type BridgeInfo = (BridgeDescriptor, UpdateTimestamp);
 
-#[derive(Default)]
 pub struct BridgeStore {
-    inner: RwLock<Inner>,
+    store: DashMap<BridgeId, BridgeInfo>,
+    exit_index: DashMap<SmolStr, Vec<BridgeId>>,
 }
 
-#[derive(Default)]
-struct Inner {
-    store: HashMap<BridgeId, BridgeInfo>,
-    exit_index: HashMap<SmolStr, Vec<BridgeId>>,
+impl Default for BridgeStore {
+    fn default() -> Self {
+        BridgeStore {
+            store: DashMap::new(),
+            exit_index: DashMap::new(),
+        }
+    }
 }
 
 impl BridgeStore {
     pub fn add_bridge(&self, bridge: &BridgeDescriptor) {
         let id = (bridge.protocol.clone(), bridge.endpoint);
-        let mut inner = self.inner.write();
-        inner
-            .store
+        self.store
             .insert(id.clone(), (bridge.clone(), bridge.update_time));
-        inner
-            .exit_index
+
+        self.exit_index
             .entry(bridge.exit_hostname.clone())
             .or_default()
             .push(id);
     }
 
-    pub fn get_bridges(&self, exit: &str) -> Vec<BridgeDescriptor> {
-        let exit = SmolStr::new(exit);
-        let inner = self.inner.read();
-        if let Some(ids) = inner.exit_index.get(&exit) {
-            ids.iter()
-                .filter_map(|id| inner.store.get(id).map(|bridge_info| bridge_info.0.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        }
+    pub fn get_bridges(&self, exit_hostname: SmolStr) -> Vec<BridgeDescriptor> {
+        self.exit_index
+            .get(&exit_hostname)
+            .map(|bridge_ids| {
+                bridge_ids
+                    .iter()
+                    .filter_map(|id| self.store.get(id).map(|bridge_info| bridge_info.0.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn delete_bridge(&self, bridge_id: &BridgeId) {
-        let mut inner = self.inner.write();
-        if let Some((bridge, _)) = inner.store.remove(bridge_id) {
-            if let Some(ids) = inner.exit_index.get_mut(&bridge.exit_hostname) {
-                ids.retain(|id| id != bridge_id);
-                if ids.is_empty() {
-                    inner.exit_index.remove(&bridge.exit_hostname);
-                }
+        if let Some((_, (bridge, _))) = self.store.remove(bridge_id) {
+            if let Some(mut exit_bridges) = self.exit_index.get_mut(&bridge.exit_hostname) {
+                exit_bridges.retain(|id| id != bridge_id);
             }
         }
     }
@@ -67,22 +63,17 @@ impl BridgeStore {
             .unwrap()
             .as_secs();
 
-        let inner = self.inner.read();
-        let expired_ids: Vec<BridgeId> = inner
+        let expired: Vec<_> = self
             .store
             .iter()
-            .filter_map(|(id, (_, update_time))| {
-                if *update_time < now - time_to_live_secs {
-                    Some(id.clone())
-                } else {
-                    None
-                }
+            .filter(|pair| {
+                let (_, (_, update_time)) = pair.pair();
+                *update_time < now - time_to_live_secs
             })
+            .map(|pair| pair.key().clone())
             .collect();
 
-        drop(inner);
-
-        for id in expired_ids {
+        for id in expired {
             self.delete_bridge(&id);
         }
     }
