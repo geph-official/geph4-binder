@@ -55,7 +55,7 @@ static GOVERNOR: LazyLock<
 
 static FAILED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
-static TRUE_RPS: AtomicU32 = AtomicU32::new(100);
+static TRUE_RPS: AtomicU32 = AtomicU32::new(150);
 
 pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()> {
     smolscale::spawn(async {
