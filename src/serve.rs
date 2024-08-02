@@ -124,7 +124,7 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                     let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
                     statsd_client.incr(&req.method);
                     let method = req.method.clone();
-                    let resp = bcw.respond_raw(req).timeout(Duration::from_secs(1)).await;
+                    let resp = bcw.respond_raw(req).timeout(Duration::from_secs(3)).await;
                     if let Some(resp) = resp {
                         statsd_client.timer(
                             &format!("latencyv2.{}", method),
