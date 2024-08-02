@@ -83,6 +83,7 @@ melbootstrap = "0.8.3"
 tmelcrypt = "0.2.7"
 sosistab2 = "0.8.16"
 http = "0.2"
+governor = "0.6.3"
 
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

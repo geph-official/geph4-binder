@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -82,7 +83,7 @@ pub struct BinderCoreV2 {
     _task: Task<()>,
 }
 
-pub const POOL_SIZE: u32 = 300;
+pub const POOL_SIZE: u32 = 50;
 
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
@@ -260,10 +261,12 @@ impl BinderCoreV2 {
 
             summary_cache,
 
-            epoch_key_cache: Cache::new(10000),
+            epoch_key_cache: Cache::builder()
+                .time_to_idle(Duration::from_secs(86400))
+                .build(),
 
             bridge_per_key: Cache::builder()
-                .time_to_live(Duration::from_secs(30))
+                .time_to_live(Duration::from_secs(120))
                 .build(),
 
             bridge_store,
@@ -278,16 +281,20 @@ impl BinderCoreV2 {
                 .time_to_live(Duration::from_secs(120))
                 .build(),
 
-            user_id_cache: Cache::builder().max_capacity(100000).build(),
+            user_id_cache: Cache::builder()
+                .time_to_idle(Duration::from_secs(86400))
+                .build(),
 
             postgres,
 
             statsd_client,
 
-            validate_cache: Cache::new(100000),
+            validate_cache: Cache::builder()
+                .time_to_idle(Duration::from_secs(86400))
+                .build(),
 
             pwd_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(3600))
+                .time_to_idle(Duration::from_secs(86400))
                 .build(),
 
             _task,
@@ -306,9 +313,7 @@ impl BinderCoreV2 {
     /// Obtains the Mizaru signing key.
     pub async fn get_mizaru_sk(&self, level: Level) -> mizaru::SecretKey {
         // the directory to locally cache signing keys
-        let mut cache_location = dirs::cache_dir()
-            .expect("no cache dir for mizaru")
-            .tap_mut(|p| p.push("mizaru"));
+        let mut cache_location = PathBuf::from("/var/tmp/mizaru");
         cache_location.push(match level {
             Level::Free => "free.bin",
             Level::Plus => "plus.bin",
@@ -576,10 +581,6 @@ impl BinderCoreV2 {
             false
         };
 
-        // if is_legacy {
-        //     return Ok(vec![]);
-        // }
-
         self.statsd_client.incr(&format!(
             "gb_versions.{}",
             token
@@ -610,7 +611,7 @@ impl BinderCoreV2 {
 
                 let mut all_bridges: Vec<BridgeDescriptor> = self
                     .bridge_store
-                    .get_bridges(exit)
+                    .get_bridges(&exit)
                     .iter()
                     .filter_map(|bridge| {
                         let mut bridge = bridge.clone();
