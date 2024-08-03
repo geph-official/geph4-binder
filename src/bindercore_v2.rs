@@ -3,7 +3,8 @@ use std::{
     ffi::{CStr, CString},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
+    thread::available_parallelism,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -83,7 +84,8 @@ pub struct BinderCoreV2 {
     _task: Task<()>,
 }
 
-pub const POOL_SIZE: u32 = 10;
+pub static POOL_SIZE: LazyLock<u32> =
+    LazyLock::new(|| 10 as u32 * available_parallelism().unwrap().get() as u32);
 
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
@@ -94,7 +96,7 @@ impl BinderCoreV2 {
         statsd_client: Arc<statsd::Client>,
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
-            .max_connections(POOL_SIZE)
+            .max_connections(*POOL_SIZE)
             .acquire_timeout(Duration::from_secs(10))
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
