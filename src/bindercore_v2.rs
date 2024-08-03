@@ -83,7 +83,7 @@ pub struct BinderCoreV2 {
     _task: Task<()>,
 }
 
-pub const POOL_SIZE: u32 = 30;
+pub const POOL_SIZE: u32 = 10;
 
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
@@ -282,7 +282,7 @@ impl BinderCoreV2 {
                 .build(),
 
             user_id_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_secs(10))
                 .build(),
 
             postgres,
@@ -290,11 +290,11 @@ impl BinderCoreV2 {
             statsd_client,
 
             validate_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_secs(10))
                 .build(),
 
             pwd_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_secs(10))
                 .build(),
 
             _task,
