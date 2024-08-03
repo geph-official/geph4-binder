@@ -282,7 +282,7 @@ impl BinderCoreV2 {
                 .build(),
 
             user_id_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(10))
+                .time_to_idle(Duration::from_secs(86400))
                 .build(),
 
             postgres,
@@ -290,11 +290,11 @@ impl BinderCoreV2 {
             statsd_client,
 
             validate_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(10))
+                .time_to_idle(Duration::from_secs(86400))
                 .build(),
 
             pwd_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(10))
+                .time_to_idle(Duration::from_secs(86400))
                 .build(),
 
             _task,
