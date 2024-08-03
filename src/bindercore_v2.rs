@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ffi::{CStr, CString},
     path::PathBuf,
     str::FromStr,
@@ -83,7 +83,7 @@ pub struct BinderCoreV2 {
     _task: Task<()>,
 }
 
-pub const POOL_SIZE: u32 = 300;
+pub const POOL_SIZE: u32 = 30;
 
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
@@ -817,14 +817,14 @@ impl BinderCoreV2 {
         self.validate_cache
             .get_with(cache_key, async {
                 let key = self.get_mizaru_sk(token.level).await.to_public_key();
-                let value = key.blind_verify(
+
+                key.blind_verify(
                     &token.unblinded_digest,
                     &match bincode::deserialize(&token.unblinded_signature_bincode) {
                         Ok(v) => v,
                         _ => return false,
                     },
-                );
-                value
+                )
             })
             .await
     }

@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Context;
 use async_compat::CompatExt;
 use async_trait::async_trait;
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
@@ -25,19 +24,14 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-use melnet2::{wire::http::HttpBackhaul, Backhaul};
 use moka::future::Cache;
-use nanorpc::{DynRpcTransport, JrpcRequest, JrpcResponse, RpcService, RpcTransport};
+use nanorpc::{JrpcRequest, JrpcResponse, RpcService};
 
-use smol::lock::Semaphore;
 use smol_str::SmolStr;
 use smol_timeout::TimeoutExt;
 use warp::Filter;
 
-use crate::{
-    bindercore_v2::{BinderCoreV2, POOL_SIZE},
-    run_blocking, Opt,
-};
+use crate::{bindercore_v2::BinderCoreV2, run_blocking, Opt};
 
 const MAX_DATA_SIZE: usize = 2048;
 const LOTTERY_THRESHOLD: u64 = 9223372036854775808; // this threshold excludes ~50% of hashes
@@ -124,7 +118,7 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                     let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
                     statsd_client.incr(&req.method);
                     let method = req.method.clone();
-                    let resp = bcw.respond_raw(req).timeout(Duration::from_secs(3)).await;
+                    let resp = bcw.respond_raw(req).timeout(Duration::from_secs(10)).await;
                     if let Some(resp) = resp {
                         statsd_client.timer(
                             &format!("latencyv2.{}", method),
