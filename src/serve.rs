@@ -52,21 +52,21 @@ static FAILED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static TRUE_RPS: AtomicU32 = AtomicU32::new(150);
 
 pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()> {
-    smolscale::spawn(async {
-        loop {
-            let fail_count = FAILED_REQUESTS.swap(0, Ordering::Relaxed);
-            let current_rps = TRUE_RPS.load(Ordering::Relaxed);
-            let next_rps = if fail_count > 0 {
-                (current_rps * 19 / 20).max(100)
-            } else {
-                (current_rps + 20).min(BASE_RPS)
-            };
-            TRUE_RPS.store(next_rps, Ordering::Relaxed);
-            log::warn!("*** FAIL COUNT {fail_count}, current_rps {current_rps} ***");
-            smol::Timer::after(Duration::from_secs(2)).await;
-        }
-    })
-    .detach();
+    // smolscale::spawn(async {
+    //     loop {
+    //         let fail_count = FAILED_REQUESTS.swap(0, Ordering::Relaxed);
+    //         let current_rps = TRUE_RPS.load(Ordering::Relaxed);
+    //         let next_rps = if fail_count > 0 {
+    //             (current_rps * 19 / 20).max(100)
+    //         } else {
+    //             (current_rps + 20).min(BASE_RPS)
+    //         };
+    //         TRUE_RPS.store(next_rps, Ordering::Relaxed);
+    //         log::warn!("*** FAIL COUNT {fail_count}, current_rps {current_rps} ***");
+    //         smol::Timer::after(Duration::from_secs(2)).await;
+    //     }
+    // })
+    // .detach();
 
     let my_sk = core_v2.get_master_sk().await?;
     let statsd_client = Arc::new(statsd::Client::new(opt.statsd_addr, "geph4.binder").unwrap());
@@ -89,19 +89,19 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
             let statsd_client = statsd_client.clone();
 
             async move {
-                let chunk = BASE_RPS / TRUE_RPS.load(Ordering::Relaxed);
-                if GOVERNOR
-                    .check_n(NonZeroU32::new(chunk).unwrap())
-                    .unwrap()
-                    .is_err()
-                {
-                    // statsd_client.incr("GOVERNED");
-                    // log::warn!("SLOWING DOWN");
-                    return http::Response::builder()
-                        .status(http::StatusCode::TOO_MANY_REQUESTS)
-                        .body(Bytes::from_static(b"WAAY Too Many Requests"))
-                        .unwrap();
-                }
+                // let chunk = BASE_RPS / TRUE_RPS.load(Ordering::Relaxed);
+                // if GOVERNOR
+                //     .check_n(NonZeroU32::new(chunk).unwrap())
+                //     .unwrap()
+                //     .is_err()
+                // {
+                //     // statsd_client.incr("GOVERNED");
+                //     // log::warn!("SLOWING DOWN");
+                //     return http::Response::builder()
+                //         .status(http::StatusCode::TOO_MANY_REQUESTS)
+                //         .body(Bytes::from_static(b"WAAY Too Many Requests"))
+                //         .unwrap();
+                // }
 
                 let fallible = smolscale::spawn(async move {
                     let (decrypted, their_pk) = if let Ok(val) = run_blocking({
@@ -118,18 +118,15 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                     let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
                     statsd_client.incr(&req.method);
                     let method = req.method.clone();
-                    let resp = bcw.respond_raw(req).timeout(Duration::from_secs(10)).await;
-                    if let Some(resp) = resp {
-                        statsd_client.timer(
-                            &format!("latencyv2.{}", method),
-                            start.elapsed().as_secs_f64(),
-                        );
-                        let resp = serde_json::to_vec(&resp)?;
-                        let resp = run_blocking(move || box_encrypt(&resp, my_sk, their_pk)).await;
-                        anyhow::Ok(resp)
-                    } else {
-                        anyhow::bail!("timeout due to overload")
-                    }
+                    let resp = bcw.respond_raw(req).await;
+
+                    statsd_client.timer(
+                        &format!("latencyv2.{}", method),
+                        start.elapsed().as_secs_f64(),
+                    );
+                    let resp = serde_json::to_vec(&resp)?;
+                    let resp = run_blocking(move || box_encrypt(&resp, my_sk, their_pk)).await;
+                    anyhow::Ok(resp)
                 });
                 match fallible.await {
                     Ok(res) => http::Response::builder().body(res).unwrap(),
