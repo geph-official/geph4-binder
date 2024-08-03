@@ -97,7 +97,7 @@ impl BinderCoreV2 {
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
             .max_connections(*POOL_SIZE)
-            .acquire_timeout(Duration::from_secs(10))
+            .acquire_timeout(Duration::from_secs(120))
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
                 PgConnectOptions::from_str(database_url)?
