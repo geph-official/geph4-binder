@@ -63,7 +63,7 @@ pub struct BinderCoreV2 {
     // in-memory store for bridge descriptors
     bridge_store: Arc<BridgeStore>,
 
-    // pwd_cache: Cache<(SmolStr, SmolStr), bool>,
+    pwd_cache: Cache<(SmolStr, SmolStr), bool>,
 
     // caches the "premium routes"
     premium_route_cache: Cache<(), imbl::HashSet<SmolStr>>,
@@ -295,9 +295,10 @@ impl BinderCoreV2 {
                 .time_to_idle(Duration::from_secs(86400))
                 .build(),
 
-            // pwd_cache: Cache::builder()
-            //     .time_to_idle(Duration::from_secs(86400))
-            //     .build(),
+            pwd_cache: Cache::builder()
+                .time_to_idle(Duration::from_secs(86400))
+                .build(),
+
             _task,
         })
     }
@@ -847,6 +848,14 @@ impl BinderCoreV2 {
 
     /// Verifies the password.
     async fn verify_password(&self, username: &str, password: &str) -> anyhow::Result<bool> {
+        if let Some(val) = self
+            .pwd_cache
+            .get(&(username.into(), password.into()))
+            .await
+        {
+            // log::info!("HIT for username {username}");
+            return Ok(val);
+        }
         // log::info!("MISS for username {username}");
         let mut txn = self.postgres.begin().await?;
         let (pwdhash,): (String,) = if let Some(v) =
@@ -859,7 +868,17 @@ impl BinderCoreV2 {
         } else {
             return Ok(false);
         };
-        Ok(verify_libsodium_password(password.to_string(), pwdhash).await)
+        if verify_libsodium_password(password.to_string(), pwdhash).await {
+            self.pwd_cache
+                .insert((username.into(), password.into()), true)
+                .await;
+            Ok(true)
+        } else {
+            self.pwd_cache
+                .insert((username.into(), password.into()), false)
+                .await;
+            Ok(false)
+        }
     }
 
     /// Gets announcements.
