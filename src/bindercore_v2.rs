@@ -127,7 +127,7 @@ impl BinderCoreV2 {
                         .fetch_all(&postgres2)
                         .await
                         .unwrap();
-                        let mapping = rows
+                        let mapping: HashMap<_, _> = rows
                             .into_iter()
                             .map(|row| {
                                 (
@@ -139,6 +139,7 @@ impl BinderCoreV2 {
                                 )
                             })
                             .collect();
+                        log::warn!("got {} subscriptions", mapping.len());
                         *cached_subscriptions.write() = mapping;
 
                         smol::Timer::after(Duration::from_secs(fastrand::u64(0..5))).await;
