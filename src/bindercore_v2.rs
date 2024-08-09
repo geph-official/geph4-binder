@@ -72,9 +72,6 @@ pub struct BinderCoreV2 {
 
     validate_cache: Cache<blake3::Hash, bool>,
 
-    // cached list of subscriptions
-    cached_subscriptions: Arc<RwLock<HashMap<i32, SubscriptionInfo>>>,
-
     // Postgres
     postgres: PgPool,
 
@@ -86,6 +83,13 @@ pub struct BinderCoreV2 {
 
 pub static POOL_SIZE: LazyLock<u32> =
     LazyLock::new(|| 32 * available_parallelism().unwrap().get() as u32);
+
+#[derive(sqlx::FromRow, Clone)]
+struct Subscription {
+    id: i32,
+    user_id: i32,
+    // Any other relevant fields
+}
 
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
@@ -107,43 +111,16 @@ impl BinderCoreV2 {
             .await?;
 
         let bridge_store = Arc::new(BridgeStore::default());
-        let cached_subscriptions = Arc::new(RwLock::new(HashMap::new()));
         let summary_cache = Arc::new(RwLock::new(None));
 
         let _task = {
             let postgres = postgres.clone();
             let statsd_client = statsd_client.clone();
             let bridge_store = bridge_store.clone();
-            let cached_subscriptions = cached_subscriptions.clone();
+
             let summary_cache = summary_cache.clone();
             smolscale::spawn(async move {
-                let postgres2 = postgres.clone();
                 let postgres3 = postgres.clone();
-                let _refresh_cached_subs = smolscale::spawn(async move {
-                    loop {
-                        let rows: Result<Vec<(i32, String, f64)>, _> = sqlx::query_as(
-                            "select id,plan,extract(epoch from expires) from subscriptions",
-                        )
-                        .fetch_all(&postgres2)
-                        .await;
-                        if let Ok(rows) = rows {
-                            let mapping = rows
-                                .into_iter()
-                                .map(|row| {
-                                    (
-                                        row.0,
-                                        SubscriptionInfo {
-                                            level: Level::Plus,
-                                            expires_unix: row.2 as _,
-                                        },
-                                    )
-                                })
-                                .collect();
-                            *cached_subscriptions.write() = mapping;
-                        }
-                        smol::Timer::after(Duration::from_secs(fastrand::u64(0..5))).await;
-                    }
-                });
 
                 let _refresh_summary = smolscale::spawn(async move {
                     loop {
@@ -272,8 +249,6 @@ impl BinderCoreV2 {
                 .build(),
 
             bridge_store,
-
-            cached_subscriptions,
 
             announcements_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(600))
@@ -937,12 +912,23 @@ impl BinderCoreV2 {
         } else {
             return Ok(None);
         };
-        let sub_info = self.cached_subscriptions.read().get(&userid).cloned();
+
+        let sub_info = sqlx::query_as(
+            "SELECT EXTRACT(EPOCH FROM expires) AS expires_unix FROM subscriptions WHERE id = $1",
+        )
+        .bind(userid)
+        .fetch_optional(&self.postgres)
+        .await?
+        .map(|record: (i64,)| SubscriptionInfo {
+            level: Level::Plus, // Assuming all levels are Level::Plus
+            expires_unix: record.0,
+        });
 
         let response = UserInfoV2 {
             userid,
             subscription: sub_info,
         };
+
         Ok(Some(response))
     }
 
