@@ -85,7 +85,7 @@ pub struct BinderCoreV2 {
 }
 
 pub static POOL_SIZE: LazyLock<u32> =
-    LazyLock::new(|| 16 * available_parallelism().unwrap().get() as u32);
+    LazyLock::new(|| 32 * available_parallelism().unwrap().get() as u32);
 
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
@@ -97,7 +97,7 @@ impl BinderCoreV2 {
     ) -> anyhow::Result<Self> {
         let postgres = PoolOptions::new()
             .max_connections(*POOL_SIZE)
-            .acquire_timeout(Duration::from_secs(10))
+            .acquire_timeout(Duration::from_secs(60))
             .max_lifetime(Duration::from_secs(600))
             .connect_with(
                 PgConnectOptions::from_str(database_url)?
