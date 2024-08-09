@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use async_compat::CompatExt;
 use async_trait::async_trait;
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
@@ -118,7 +119,11 @@ pub async fn start_server(core_v2: BinderCoreV2, opt: Opt) -> anyhow::Result<()>
                     let req: JrpcRequest = serde_json::from_slice(&decrypted)?;
                     statsd_client.incr(&req.method);
                     let method = req.method.clone();
-                    let resp = bcw.respond_raw(req).await;
+                    let resp = bcw
+                        .respond_raw(req)
+                        .timeout(Duration::from_secs(5))
+                        .await
+                        .context("respond_raw timed out")?;
 
                     statsd_client.timer(
                         &format!("latencyv2.{}", method),
