@@ -914,7 +914,7 @@ impl BinderCoreV2 {
         };
 
         let sub_info = sqlx::query_as(
-            "SELECT EXTRACT(EPOCH FROM expires)::BIGINT AS expires_unix FROM subscriptions WHERE id = $1",
+            "SELECT EXTRACT(EPOCH FROM expires) AS expires_unix FROM subscriptions WHERE id = $1",
         )
         .bind(userid)
         .fetch_optional(&self.postgres)
