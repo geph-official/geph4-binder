@@ -121,8 +121,8 @@ impl BinderCoreV2 {
                 let postgres3 = postgres.clone();
                 let _refresh_cached_subs = smolscale::spawn(async move {
                     loop {
-                        let rows: Vec<(i32, String, f64)> = sqlx::query_as(
-                            "select id,plan,extract(epoch from expires) from subscriptions",
+                        let rows: Vec<(i32, String, i64)> = sqlx::query_as(
+                            "select id,plan,extract(epoch from expires)::bigint from subscriptions",
                         )
                         .fetch_all(&postgres2)
                         .await
