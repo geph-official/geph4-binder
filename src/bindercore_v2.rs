@@ -121,26 +121,26 @@ impl BinderCoreV2 {
                 let postgres3 = postgres.clone();
                 let _refresh_cached_subs = smolscale::spawn(async move {
                     loop {
-                        let rows: Result<Vec<(i32, String, f64)>, _> = sqlx::query_as(
+                        let rows: Vec<(i32, String, f64)> = sqlx::query_as(
                             "select id,plan,extract(epoch from expires) from subscriptions",
                         )
                         .fetch_all(&postgres2)
-                        .await;
-                        if let Ok(rows) = rows {
-                            let mapping = rows
-                                .into_iter()
-                                .map(|row| {
-                                    (
-                                        row.0,
-                                        SubscriptionInfo {
-                                            level: Level::Plus,
-                                            expires_unix: row.2 as _,
-                                        },
-                                    )
-                                })
-                                .collect();
-                            *cached_subscriptions.write() = mapping;
-                        }
+                        .await
+                        .unwrap();
+                        let mapping = rows
+                            .into_iter()
+                            .map(|row| {
+                                (
+                                    row.0,
+                                    SubscriptionInfo {
+                                        level: Level::Plus,
+                                        expires_unix: row.2 as _,
+                                    },
+                                )
+                            })
+                            .collect();
+                        *cached_subscriptions.write() = mapping;
+
                         smol::Timer::after(Duration::from_secs(fastrand::u64(0..5))).await;
                     }
                 });
