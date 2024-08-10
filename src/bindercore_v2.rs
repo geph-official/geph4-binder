@@ -142,7 +142,7 @@ impl BinderCoreV2 {
                         log::warn!("got {} subscriptions", mapping.len());
                         *cached_subscriptions.write() = mapping;
 
-                        smol::Timer::after(Duration::from_secs(fastrand::u64(0..5))).await;
+                        smol::Timer::after(Duration::from_secs(fastrand::u64(0..30))).await;
                     }
                 });
 
@@ -232,7 +232,7 @@ impl BinderCoreV2 {
                     }
                 });
 
-                loop {
+                for ctr in 0.. {
                     smol::Timer::after(Duration::from_secs(fastrand::u64(0..120))).await;
 
                     // clean up old bridges
@@ -245,15 +245,18 @@ impl BinderCoreV2 {
                     .await
                     .unwrap();
 
-                    let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
+                    if ctr % 10 == 0 {
+                        let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
                     .fetch_one(& postgres)
                     .await.unwrap();
-                    let (subcount,): (i64,) = sqlx::query_as("select count(*) from subscriptions")
-                        .fetch_one(&postgres)
-                        .await
-                        .unwrap();
-                    statsd_client.gauge("usercount", usercount as f64);
-                    statsd_client.gauge("subcount", subcount as f64);
+                        let (subcount,): (i64,) =
+                            sqlx::query_as("select count(*) from subscriptions")
+                                .fetch_one(&postgres)
+                                .await
+                                .unwrap();
+                        statsd_client.gauge("usercount", usercount as f64);
+                        statsd_client.gauge("subcount", subcount as f64);
+                    }
                 }
             })
         };
