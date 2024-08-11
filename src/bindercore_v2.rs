@@ -969,6 +969,12 @@ impl BinderCoreV2 {
         // txn.commit().await?;
         Ok(())
     }
+
+    /// Checks the health of the database connection by executing a simple query.
+    pub async fn check_db_health(&self) -> anyhow::Result<()> {
+        sqlx::query("SELECT 1").fetch_one(&self.postgres).await?;
+        Ok(())
+    }
 }
 
 /// Verify a captcha.
