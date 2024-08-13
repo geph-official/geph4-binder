@@ -268,7 +268,7 @@ impl BinderCoreV2 {
             summary_cache,
 
             epoch_key_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_secs(86400 * 7))
                 .build(),
 
             bridge_per_key: Cache::builder()
@@ -288,7 +288,7 @@ impl BinderCoreV2 {
                 .build(),
 
             user_id_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_secs(86400 * 7))
                 .build(),
 
             postgres,
@@ -296,11 +296,11 @@ impl BinderCoreV2 {
             statsd_client,
 
             validate_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_secs(86400 * 7))
                 .build(),
 
             pwd_cache: Cache::builder()
-                .time_to_idle(Duration::from_secs(86400))
+                .time_to_idle(Duration::from_secs(86400 * 7))
                 .build(),
 
             _task,
