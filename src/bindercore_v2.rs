@@ -245,18 +245,17 @@ impl BinderCoreV2 {
                     .await
                     .unwrap();
 
-                    if ctr % 10 == 0 {
-                        let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
+                    // if ctr % 10 == 0 {
+                    let (usercount,): (i64,) = sqlx::query_as("select count(distinct id) from auth_logs where last_login > NOW() - interval '1 day'")
                     .fetch_one(& postgres)
                     .await.unwrap();
-                        let (subcount,): (i64,) =
-                            sqlx::query_as("select count(*) from subscriptions")
-                                .fetch_one(&postgres)
-                                .await
-                                .unwrap();
-                        statsd_client.gauge("usercount", usercount as f64);
-                        statsd_client.gauge("subcount", subcount as f64);
-                    }
+                    let (subcount,): (i64,) = sqlx::query_as("select count(*) from subscriptions")
+                        .fetch_one(&postgres)
+                        .await
+                        .unwrap();
+                    statsd_client.gauge("usercount", usercount as f64);
+                    statsd_client.gauge("subcount", subcount as f64);
+                    // }
                 }
             })
         };
