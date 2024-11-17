@@ -245,8 +245,7 @@ impl BinderCoreV2 {
                     .await
                     .unwrap();
 
-                    let (subcount,): (i64,) =
-                    sqlx::query_as("select count(*) from subscriptions")
+                    let (subcount,): (i64,) = sqlx::query_as("select count(*) from subscriptions")
                         .fetch_one(&postgres)
                         .await
                         .unwrap();
@@ -258,7 +257,6 @@ impl BinderCoreV2 {
                     .await.unwrap();
 
                         statsd_client.gauge("usercount", usercount as f64);
-
                     }
                 }
             })
@@ -892,7 +890,7 @@ impl BinderCoreV2 {
     pub async fn get_announcements(&self) -> String {
         self.announcements_cache
             .try_get_with((), async {
-                let resp = reqwest::get("https://rsshub.app/telegram/channel/gephannounce")
+                let resp = reqwest::get("https://rsshub.app/telegram/channel/gephannounce_mirror")
                     .compat()
                     .await?;
                 let bts = resp.bytes().await?;
