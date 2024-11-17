@@ -888,7 +888,8 @@ impl BinderCoreV2 {
 
     /// Gets announcements.
     pub async fn get_announcements(&self) -> String {
-        self.announcements_cache
+        let s = self
+            .announcements_cache
             .try_get_with((), async {
                 let resp = reqwest::get("https://rsshub.app/telegram/channel/gephannounce_mirror")
                     .compat()
@@ -897,7 +898,8 @@ impl BinderCoreV2 {
                 anyhow::Ok(String::from_utf8_lossy(&bts).to_string())
             })
             .await
-            .unwrap_or_else(|_| "Failed to fetch announcements".to_string())
+            .unwrap_or_else(|_| "Failed to fetch announcements".to_string());
+        fix_rss(&s)
     }
 
     async fn get_user_id(&self, credentials: &Credentials) -> Result<Option<i32>, sqlx::Error> {
@@ -976,6 +978,14 @@ impl BinderCoreV2 {
         sqlx::query("SELECT 1").fetch_one(&self.postgres).await?;
         Ok(())
     }
+}
+
+fn fix_rss(text: &str) -> String {
+    // Regular expression to match the forwarded pattern
+    let re = regex::Regex::new(r"<p>Forwarded[^<]*</p>").unwrap();
+
+    // Replace all matched patterns with empty string
+    re.replace_all(text.trim(), "").to_string()
 }
 
 /// Verify a captcha.
