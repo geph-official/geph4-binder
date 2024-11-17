@@ -981,11 +981,8 @@ impl BinderCoreV2 {
 }
 
 fn fix_rss(text: &str) -> String {
-    // Regular expression to match the forwarded pattern
-    let re = regex::Regex::new(r"<p>Forwarded[^<]*</p>").unwrap();
-
-    // Replace all matched patterns with empty string
-    re.replace_all(text.trim(), "").to_string()
+    text.replace("Forwarded From", "")
+        .replace("(nullchinchilla)", "")
 }
 
 /// Verify a captcha.
