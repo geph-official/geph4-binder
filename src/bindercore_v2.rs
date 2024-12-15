@@ -85,7 +85,7 @@ pub struct BinderCoreV2 {
 }
 
 pub static POOL_SIZE: LazyLock<u32> =
-    LazyLock::new(|| 3 * available_parallelism().unwrap().get() as u32);
+    LazyLock::new(|| 8 * available_parallelism().unwrap().get() as u32);
 
 impl BinderCoreV2 {
     /// Constructs a BinderCore.
