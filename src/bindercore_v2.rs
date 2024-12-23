@@ -41,7 +41,10 @@ use sqlx::{
 };
 use tap::Tap;
 
-use crate::{bridge_store::BridgeStore, records::ExitRecord, run_blocking};
+use crate::{
+    announcements::get_announcements_rss, bridge_store::BridgeStore, records::ExitRecord,
+    run_blocking,
+};
 
 pub struct BinderCoreV2 {
     captcha_service_url: SmolStr,
@@ -888,7 +891,15 @@ impl BinderCoreV2 {
 
     /// Gets announcements.
     pub async fn get_announcements(&self) -> String {
-        include_str!("mock_rss.xml").to_string()
+        loop {
+            match get_announcements_rss().await {
+                Ok(val) => return val,
+                Err(err) => {
+                    log::error!("failed to get announces: {:?}", err);
+                    smol::Timer::after(Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 
     async fn get_user_id(&self, credentials: &Credentials) -> Result<Option<i32>, sqlx::Error> {

@@ -85,6 +85,8 @@ sosistab2 = "0.8.16"
 http = "0.2"
 governor = "0.6.3"
 regex = "1.11.1"
+pulldown-cmark = "0.12.2"
+html-escape = "0.2.13"
 
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
