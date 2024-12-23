@@ -15,7 +15,7 @@ async fn get_raw_announcements() -> anyhow::Result<Vec<(String, String)>> {
     for chunk in resp.split("---") {
         let captures = re.captures(chunk).context("missing date string")?;
         let date_str = captures.get(1).context("missing capture in date string")?;
-        let cleaned_text = re.replace(&resp, "");
+        let cleaned_text = re.replace(chunk, "");
         v.push((date_str.as_str().to_string(), cleaned_text.to_string()));
     }
     Ok(v)
