@@ -35,7 +35,8 @@ pub async fn get_announcements_rss() -> anyhow::Result<String> {
         pulldown_cmark::html::push_html(&mut raw_html, pulldown_cmark::Parser::new(&raw_md));
         let raw_html_escaped = html_escape::encode_safe(&raw_html);
         let pub_date = convert_date(&date)?;
-        inner.push_str(&format!("<item><title>New</title><link>https://t.me/gephannounce</link><description>{raw_html_escaped}</description><pubDate>{pub_date}</pubDate></item>\n\n"));
+        let hash = blake3::hash(raw_html.as_bytes()).to_hex();
+        inner.push_str(&format!("<item><title>New</title><link>https://t.me/gephannounce?hash={hash}</link><description>{raw_html_escaped}</description><pubDate>{pub_date}</pubDate></item>\n\n"));
     }
     let res = format!(
         r#"
