@@ -33,6 +33,7 @@ pub async fn get_announcements_rss() -> anyhow::Result<String> {
     for (date, raw_md) in raw {
         let mut raw_html = "".to_string();
         pulldown_cmark::html::push_html(&mut raw_html, pulldown_cmark::Parser::new(&raw_md));
+        raw_html = raw_html.replace("<a", "<a target='_blank' ");
         let raw_html_escaped = html_escape::encode_safe(&raw_html);
         let pub_date = convert_date(&date)?;
         let hash = blake3::hash(raw_html.as_bytes()).to_hex();
