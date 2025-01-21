@@ -567,11 +567,18 @@ impl BinderCoreV2 {
 
     /// Obtains the summary of the whole state.
     pub async fn get_summary(&self) -> anyhow::Result<MasterSummary> {
-        self.summary_cache
+        let mut summary = self
+            .summary_cache
             .read()
             .as_ref()
             .cloned()
-            .context("summary not available yet")
+            .context("summary not available yet")?;
+        // Jan 22 2025 brownout
+        let tstamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        if tstamp > 1737504000 && tstamp < 1737590400 {
+            summary.exits = vec![];
+        }
+        Ok(summary)
     }
 
     /// Obtains a list of bridges, filtered to only the bridges this user should care about.
