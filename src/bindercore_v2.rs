@@ -573,11 +573,19 @@ impl BinderCoreV2 {
             .as_ref()
             .cloned()
             .context("summary not available yet")?;
-        // Jan 22 2025 brownout
+
+        // Brownouts for Jan 22 2025 (00:00–24:00 UTC) and Jan 27 2025 (00:00–24:00 UTC).
         let tstamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        if tstamp > 1737504000 && tstamp < 1737590400 {
+
+        if
+        // Jan 22 2025: 1737504000..1737590400
+        (tstamp >= 1737504000 && tstamp < 1737590400)
+        // Jan 27 2025: 1737936000..1738022400
+        || (tstamp >= 1737936000 && tstamp < 1738022400)
+        {
             summary.exits = vec![];
         }
+
         Ok(summary)
     }
 
