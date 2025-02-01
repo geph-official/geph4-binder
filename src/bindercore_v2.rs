@@ -564,7 +564,6 @@ impl BinderCoreV2 {
 
         Ok(())
     }
-
     /// Obtains the summary of the whole state.
     pub async fn get_summary(&self) -> anyhow::Result<MasterSummary> {
         let mut summary = self
@@ -574,14 +573,18 @@ impl BinderCoreV2 {
             .cloned()
             .context("summary not available yet")?;
 
-        // Brownouts for Jan 22 2025 (00:00–24:00 UTC) and Jan 27 2025 (00:00–24:00 UTC).
+        // Brownouts for Jan 22 2025 (00:00–24:00 UTC),
+        // Jan 27 2025 (00:00–24:00 UTC),
+        // and after Feb 1 2025 (00:00 UTC).
         let tstamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
         if
         // Jan 22 2025: 1737504000..1737590400
         (tstamp >= 1737504000 && tstamp < 1737590400)
-        // Jan 27 2025: 1737936000..1738022400
-        || (tstamp >= 1737936000 && tstamp < 1738022400)
+       // Jan 27 2025: 1737936000..1738022400
+       || (tstamp >= 1737936000 && tstamp < 1738022400)
+       // After Feb 1 2025: 1738368000..
+       || (tstamp >= 1738368000)
         {
             summary.exits = vec![];
         }
